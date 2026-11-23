@@ -9,7 +9,10 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 mod analysis;
 mod components;
-use analysis::{AnalysisEdge, analyze_component_references, analyze_scripts};
+use analysis::{
+    AnalysisEdge, WorkflowCandidate, analyze_component_references, analyze_scripts,
+    discover_workflows,
+};
 use components::{Component, XmlNode, extract_data_model};
 use quick_xml::{Reader, XmlVersion, encoding::DecodingReader, events::Event};
 use serde::{Deserialize, Serialize};
@@ -113,6 +116,12 @@ struct EdgeExport<'a> {
     edges: &'a [AnalysisEdge],
 }
 
+#[derive(Serialize)]
+struct WorkflowExport<'a> {
+    schema_version: u32,
+    workflows: &'a [WorkflowCandidate],
+}
+
 #[derive(Deserialize, Serialize)]
 struct ComponentPageManifest {
     schema_version: u32,
@@ -213,6 +222,7 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
             .then(left.to_record_id.cmp(&right.to_record_id))
             .then(left.evidence.cmp(&right.evidence))
     });
+    let workflows = discover_workflows(&components, &edges);
 
     fs::create_dir_all(&output)
         .with_context(|| format!("cannot create output directory {}", output.display()))?;
@@ -238,8 +248,217 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
     )?;
     write_component_docs(&output, &components, &edges)?;
     write_permission_matrix(&output, &components)?;
+    write_integration_docs(&output, &components, &edges, &workflows)?;
     println!("Inventory written to {}", output.display());
     Ok(())
+}
+
+fn write_integration_docs(
+    output: &Path,
+    components: &[Component],
+    edges: &[AnalysisEdge],
+    workflows: &[WorkflowCandidate],
+) -> Result<()> {
+    let integrations = output.join("integrations");
+    fs::create_dir_all(&integrations)?;
+    let mut markdown = String::from(
+        "# Integration inventory\n\nThis report lists external data-source records and explicit references found in the export. Script effects are static step classifications; endpoint behavior and successful runtime access are not established.\n\n## External data sources\n\n",
+    );
+    let sources: Vec<_> = components
+        .iter()
+        .filter(|component| component.kind == "external_data_source")
+        .collect();
+    if sources.is_empty() {
+        markdown.push_str("No external data-source records were present.\n");
+    }
+    for source in sources {
+        let references: Vec<_> = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "accesses_external_source"
+                    && edge.to_object_id.as_deref() == Some(source.object_id.as_str())
+            })
+            .collect();
+        markdown.push_str(&format!(
+            "- **{}** (`{}`; action `{}`): {} explicit reference(s). Source record: `objects/{}`.\n",
+            md(&source.name), md(&source.object_id), md(&source.source_action), references.len(), component_page_relative_path(source, components)
+        ));
+    }
+    markdown.push_str("\n## Script effects associated with integrations\n\n");
+    let mut found_effect = false;
+    for script in components
+        .iter()
+        .filter(|component| component.kind == "script")
+    {
+        let effects: Vec<_> = script
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.kind == "step_effect"
+                    && [
+                        "opening a URL",
+                        "fetching data from a URL",
+                        "email sending",
+                        "record import",
+                        "record export",
+                        "calling a server-side script",
+                        "executing JavaScript in a web viewer",
+                        "changing web-viewer content",
+                    ]
+                    .iter()
+                    .any(|effect| finding.summary.contains(effect))
+            })
+            .collect();
+        if effects.is_empty() {
+            continue;
+        }
+        found_effect = true;
+        markdown.push_str(&format!(
+            "- **{}** (`{}`): {}. Evidence:\n",
+            md(&script.name),
+            md(&script.object_id),
+            effects
+                .iter()
+                .map(|effect| md(&effect.summary))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+        for evidence in effects.iter().flat_map(|effect| &effect.evidence) {
+            markdown.push_str(&format!("  - `{}`\n", md(evidence)));
+        }
+    }
+    if !found_effect {
+        markdown.push_str("No classified URL, email, import, or export steps were found.\n");
+    }
+    markdown.push_str("\nCredentials are redacted in component records. Literal paths or URLs may be present in source properties; this summary does not execute or validate them.\n");
+    fs::write(integrations.join("overview.md"), markdown)?;
+
+    let workflow_dir = output.join("workflows");
+    fs::create_dir_all(&workflow_dir)?;
+    fs::write(
+        workflow_dir.join("workflows.json"),
+        serde_json::to_vec_pretty(&WorkflowExport {
+            schema_version: 2,
+            workflows,
+        })?,
+    )?;
+    let mut index = String::from(
+        "# Workflow candidates\n\nCandidates are derived from explicit UI-to-script or UI-navigation references and reachable script edges. They do not establish runtime order, branch outcomes, or business intent.\n\n",
+    );
+    if workflows.is_empty() {
+        index.push_str("No structurally connected workflow candidates were found.\n");
+    }
+    for (number, workflow) in workflows.iter().enumerate() {
+        let filename = format!("{:04}-{}.md", number + 1, slug(&workflow.entry_name));
+        let entry_link = components
+            .iter()
+            .find(|component| {
+                component.object_id == workflow.entry_object_id
+                    && component.source_action == "AddAction"
+            })
+            .or_else(|| {
+                components
+                    .iter()
+                    .find(|component| component.object_id == workflow.entry_object_id)
+            })
+            .map(|component| {
+                format!(
+                    "[{}](../objects/{})",
+                    md(&component_display_name(component)),
+                    component_page_relative_path(component, components)
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{} (`{}`)",
+                    md(&workflow.entry_kind),
+                    md(&workflow.entry_object_id)
+                )
+            });
+        index.push_str(&format!(
+            "- [{}]({filename}) — entry {entry_link}; {} reachable script(s), status `{}`\n",
+            md(&workflow.entry_name),
+            workflow.script_ids.len(),
+            workflow.status
+        ));
+        let mut page = format!(
+            "# {}\n\n- Status: `{}`\n- Entry: {entry_link}\n- Source: `{}`\n",
+            md(&workflow.entry_name),
+            workflow.status,
+            md(&workflow.source_file)
+        );
+        for (label, ids) in [
+            ("Scripts", &workflow.script_ids),
+            ("Layouts", &workflow.layout_ids),
+            ("Fields read", &workflow.field_read_ids),
+            ("Fields written", &workflow.field_write_ids),
+            ("Table occurrences", &workflow.table_occurrence_ids),
+            ("External sources", &workflow.external_source_ids),
+        ] {
+            page.push_str(&format!("\n## {label}\n\n"));
+            if ids.is_empty() {
+                page.push_str("None resolved.\n");
+            } else {
+                for id in ids {
+                    let object = components
+                        .iter()
+                        .find(|component| {
+                            component.object_id == *id && component.source_action == "AddAction"
+                        })
+                        .or_else(|| {
+                            components
+                                .iter()
+                                .find(|component| component.object_id == *id)
+                        });
+                    if let Some(object) = object {
+                        page.push_str(&format!(
+                            "- [{}](../objects/{}) (`{}`)\n",
+                            md(&component_display_name(object)),
+                            component_page_relative_path(object, components),
+                            md(id)
+                        ));
+                    } else {
+                        page.push_str(&format!("- `{}`\n", md(id)));
+                    }
+                }
+            }
+        }
+        page.push_str("\n## Effects\n\n");
+        if workflow.effects.is_empty() {
+            page.push_str("No classified effects.\n");
+        } else {
+            for effect in &workflow.effects {
+                page.push_str(&format!("- {}\n", md(effect)));
+            }
+        }
+        page.push_str("\n## Evidence\n\n");
+        if workflow.evidence.is_empty() {
+            page.push_str("No source paths attached.\n");
+        } else {
+            for evidence in &workflow.evidence {
+                page.push_str(&format!("- `{}`\n", md(evidence)));
+            }
+        }
+        page.push_str("\n## Limitations\n\n");
+        for limitation in &workflow.limitations {
+            page.push_str(&format!("- {}\n", md(limitation)));
+        }
+        fs::write(workflow_dir.join(filename), page)?;
+    }
+    fs::write(workflow_dir.join("index.md"), index)?;
+    Ok(())
+}
+
+fn component_display_name(component: &Component) -> String {
+    if component.name.trim().is_empty() {
+        format!(
+            "{} {}",
+            component.kind,
+            component.xml_id.as_deref().unwrap_or("unknown")
+        )
+    } else {
+        component.name.clone()
+    }
 }
 
 fn prompt_path(prompt: &str, default: Option<&Path>) -> Result<PathBuf> {
@@ -654,7 +873,7 @@ fn render_markdown(inventory: &Inventory) -> String {
     }
     markdown.push_str("## Coverage\n\nCatalog inventory reports source entries by file and action. Component pages preserve available XML properties for extracted catalogs; account names and privilege-set roles are included, while passwords and credentials are redacted. Explicit references are resolved where the target is present and unambiguous; runtime behavior is not inferred.\n");
     markdown
-        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json) · [Permission matrix](security/permission-matrix.md)\n");
+        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json) · [Permission matrix](security/permission-matrix.md) · [Integrations](integrations/overview.md) · [Workflow candidates](workflows/index.md)\n");
     markdown
 }
 
@@ -808,7 +1027,101 @@ fn write_permission_matrix(output: &Path, components: &[Component]) -> Result<()
                 ));
             }
         }
-        markdown.push_str("\nAccount names and assigned privilege sets are included; passwords and credentials remain redacted in source object records. Settings are transcribed per exported action and are not an effective-access calculation.\n");
+        markdown.push_str("\n## Explicit field-access rules\n\n| File | Action | Privilege set | Account names | Table | Field | Access | Evidence |\n|---|---|---|---|---|---|---|---|\n");
+        for privilege_set in &privilege_sets {
+            let accounts = accounts_for_privilege_set(privilege_set, components);
+            let mut tables = Vec::new();
+            collect_named_nodes(&privilege_set.properties, "Table", &mut tables);
+            for table in tables {
+                let table_name = first_named_node(table, "BaseTableReference")
+                    .or_else(|| first_named_node(table, "TableOccurrenceReference"))
+                    .and_then(|reference| reference.attributes.get("name"))
+                    .map(String::as_str)
+                    .unwrap_or("unresolved table");
+                let mut field_groups = Vec::new();
+                collect_named_nodes(table, "Fields", &mut field_groups);
+                for group in field_groups {
+                    let mut fields = Vec::new();
+                    collect_named_nodes(group, "Field", &mut fields);
+                    for field in fields {
+                        let field_name = first_named_node(field, "FieldReference")
+                            .and_then(|reference| reference.attributes.get("name"))
+                            .or_else(|| field.attributes.get("name"))
+                            .map(String::as_str)
+                            .unwrap_or("unresolved field");
+                        markdown.push_str(&format!(
+                            "| {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+                            md(&privilege_set.source_file),
+                            md(&privilege_set.source_action),
+                            md(&privilege_set.name),
+                            md(if accounts.is_empty() {
+                                "—"
+                            } else {
+                                accounts.as_str()
+                            }),
+                            md(table_name),
+                            md(field_name),
+                            md(field
+                                .attributes
+                                .get("access")
+                                .map(String::as_str)
+                                .unwrap_or("not specified")),
+                            md(&privilege_set.source_path)
+                        ));
+                    }
+                }
+            }
+        }
+        markdown.push_str("\n## Explicit object-level access rules\n\n| File | Action | Privilege set | Account names | Category | Object | Settings | Evidence |\n|---|---|---|---|---|---|---|---|---|\n");
+        for privilege_set in &privilege_sets {
+            let accounts = accounts_for_privilege_set(privilege_set, components);
+            let mut access_nodes = Vec::new();
+            collect_named_nodes(&privilege_set.properties, "access", &mut access_nodes);
+            for access in access_nodes {
+                for category_name in ["Layouts", "Scripts", "ValueLists", "ExtendedPrivileges"] {
+                    let mut categories = Vec::new();
+                    collect_named_nodes(access, category_name, &mut categories);
+                    for category in categories {
+                        let object_name = match category_name {
+                            "Layouts" => "Layout",
+                            "Scripts" => "Script",
+                            "ValueLists" => "ValueList",
+                            _ => "ExtendedPrivilege",
+                        };
+                        let mut objects = Vec::new();
+                        collect_named_nodes(category, object_name, &mut objects);
+                        for object in objects {
+                            let reference_name = match object_name {
+                                "Layout" => "LayoutReference",
+                                "Script" => "ScriptReference",
+                                "ValueList" => "ValueListReference",
+                                _ => "ExtendedPrivilegeReference",
+                            };
+                            let name = first_named_node(object, reference_name)
+                                .and_then(|reference| reference.attributes.get("name"))
+                                .map(String::as_str)
+                                .unwrap_or("unresolved object");
+                            markdown.push_str(&format!(
+                                "| {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+                                md(&privilege_set.source_file),
+                                md(&privilege_set.source_action),
+                                md(&privilege_set.name),
+                                md(if accounts.is_empty() {
+                                    "—"
+                                } else {
+                                    accounts.as_str()
+                                }),
+                                md(category_name),
+                                md(name),
+                                md(&format_access_section(object)),
+                                md(&privilege_set.source_path)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        markdown.push_str("\nAccount names and assigned privilege sets are included; passwords and credentials remain redacted in source object records. Settings are transcribed per exported action and are not an effective-access calculation. Field rows appear only where the XML contains explicit per-field entries; table-level `Fields access` settings are reported above and are not expanded into invented field rows.\n");
     }
     fs::write(directory.join("permission-matrix.md"), markdown)?;
     Ok(())

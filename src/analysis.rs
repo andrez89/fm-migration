@@ -16,17 +16,38 @@ pub struct AnalysisEdge {
     pub limitations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCandidate {
+    pub id: String,
+    pub status: String,
+    pub source_file: String,
+    pub entry_object_id: String,
+    pub entry_name: String,
+    pub entry_kind: String,
+    pub script_ids: Vec<String>,
+    pub layout_ids: Vec<String>,
+    pub field_read_ids: Vec<String>,
+    pub field_write_ids: Vec<String>,
+    pub table_occurrence_ids: Vec<String>,
+    pub external_source_ids: Vec<String>,
+    pub effects: Vec<String>,
+    pub evidence: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
 #[derive(Clone)]
 struct ObjectSymbol {
     object_id: String,
     record_id: String,
     xml_id: Option<String>,
+    source_identity: String,
 }
 
 struct Symbols {
     by_uuid: BTreeMap<(String, String, String), Vec<ObjectSymbol>>,
     by_id: BTreeMap<(String, String, String), Vec<ObjectSymbol>>,
     custom_functions_by_name: BTreeMap<(String, String), Vec<ObjectSymbol>>,
+    qualified_fields: BTreeMap<(String, String), Vec<ObjectSymbol>>,
 }
 
 struct ControlBlocks {
@@ -77,6 +98,7 @@ pub fn analyze_scripts(components: &mut [Component]) -> Vec<AnalysisEdge> {
                 });
             }
             collect_variable_findings(script, step);
+            collect_script_flow_findings(script, step);
             collect_reference_edges(script, step, &symbols, &mut edges);
         }
         let active_steps: Vec<_> = steps
@@ -92,6 +114,8 @@ pub fn analyze_scripts(components: &mut [Component]) -> Vec<AnalysisEdge> {
                 .then(left.summary.cmp(&right.summary))
         });
     }
+    append_script_dataflow_candidates(components, &mut edges);
+    append_script_call_summaries(components, &edges);
     edges.sort_by(|left, right| {
         left.from_record_id
             .cmp(&right.from_record_id)
@@ -101,6 +125,256 @@ pub fn analyze_scripts(components: &mut [Component]) -> Vec<AnalysisEdge> {
             .then(left.evidence.cmp(&right.evidence))
     });
     edges
+}
+
+fn append_script_dataflow_candidates(components: &[Component], edges: &mut Vec<AnalysisEdge>) {
+    let calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == "calls_script" && edge.status == "explicit")
+        .cloned()
+        .collect();
+    for call in calls {
+        let (Some(caller_id), Some(callee_id), Some(step_record_id)) = (
+            call.from_object_id.as_deref(),
+            call.to_object_id.as_deref(),
+            call.from_record_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let caller = components.iter().find(|component| {
+            component.object_id == caller_id
+                && component
+                    .attached_records
+                    .iter()
+                    .any(|record| record.record_id == step_record_id)
+        });
+        let Some(caller) = caller else {
+            continue;
+        };
+        let Some(step) = caller
+            .attached_records
+            .iter()
+            .find(|record| record.record_id == step_record_id)
+        else {
+            continue;
+        };
+        let mut evidence = call.evidence.clone();
+        let parameter_read = components.iter().find_map(|component| {
+            (component.object_id == callee_id)
+                .then(|| {
+                    component
+                        .findings
+                        .iter()
+                        .find(|finding| finding.kind == "script_parameter_read")
+                        .map(|finding| (component, finding))
+                })
+                .flatten()
+        });
+        if contains_named_node(&step.properties, "Parameter")
+            && let Some((callee_record, read)) = parameter_read
+        {
+            evidence.extend(read.evidence.iter().cloned());
+            edges.push(AnalysisEdge {
+                kind: "passes_script_parameter_to".to_string(),
+                status: "heuristic_candidate".to_string(),
+                from_object_id: Some(caller_id.to_string()),
+                to_object_id: Some(callee_id.to_string()),
+                from_record_id: Some(step_record_id.to_string()),
+                to_record_id: Some(callee_record.record_id.clone()),
+                evidence: evidence.clone(),
+                limitations: vec!["The call has a parameter and the callee reads ScriptParameter, but the expression is not evaluated or proven to supply the value read.".to_string()],
+            });
+        }
+        let result_return = components.iter().find_map(|component| {
+            (component.object_id == callee_id)
+                .then(|| {
+                    component
+                        .findings
+                        .iter()
+                        .find(|finding| finding.kind == "script_result_return")
+                        .map(|finding| (component, finding))
+                })
+                .flatten()
+        });
+        let result_read = components.iter().find_map(|component| {
+            (component.object_id == caller_id)
+                .then(|| {
+                    component
+                        .findings
+                        .iter()
+                        .find(|finding| finding.kind == "script_result_read")
+                        .map(|finding| (component, finding))
+                })
+                .flatten()
+        });
+        if let (Some((callee_record, returned)), Some((_, read))) = (result_return, result_read) {
+            evidence.extend(returned.evidence.iter().cloned());
+            evidence.extend(read.evidence.iter().cloned());
+            edges.push(AnalysisEdge {
+                kind: "may_receive_script_result_from".to_string(),
+                status: "heuristic_candidate".to_string(),
+                from_object_id: Some(caller_id.to_string()),
+                to_object_id: Some(callee_id.to_string()),
+                from_record_id: Some(step_record_id.to_string()),
+                to_record_id: Some(callee_record.record_id.clone()),
+                evidence,
+                limitations: vec!["A caller reads ScriptResult and this callee returns a value, but the read is not tied to this call by execution order.".to_string()],
+            });
+        }
+    }
+}
+
+fn collect_script_flow_findings(script: &mut Component, step: &AttachedRecord) {
+    let mut calculations = Vec::new();
+    collect_calculation_texts(&step.properties, &mut calculations);
+    for text in calculations {
+        let normalized: String = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        for (needle, kind, summary) in [
+            (
+                "get(scriptparameter)",
+                "script_parameter_read",
+                "reads the calling script parameter",
+            ),
+            (
+                "get(scriptresult)",
+                "script_result_read",
+                "reads a called script result",
+            ),
+        ] {
+            if normalized.contains(needle) {
+                script.findings.push(AnalysisFinding {
+                    kind: kind.to_string(),
+                    status: "explicit".to_string(),
+                    summary: format!("Step {} {summary}", step.order),
+                    evidence: vec![step.source_path.clone()],
+                    limitations: vec![
+                        "The expression and runtime value are not evaluated.".to_string(),
+                    ],
+                });
+            }
+        }
+    }
+    let (kind, summary) = match step.name.as_str() {
+        "Perform Script" if contains_named_node(&step.properties, "Parameter") => (
+            "script_parameter_pass",
+            "passes a parameter to the called script",
+        ),
+        "Exit Script" if contains_named_node(&step.properties, "Calculation") => {
+            ("script_result_return", "returns a calculated script result")
+        }
+        _ => return,
+    };
+    script.findings.push(AnalysisFinding {
+        kind: kind.to_string(),
+        status: "explicit".to_string(),
+        summary: format!("Step {} {summary}", step.order),
+        evidence: vec![step.source_path.clone()],
+        limitations: vec!["The parameter/result expression is preserved in source data but is not evaluated or matched across caller and callee.".to_string()],
+    });
+}
+
+fn contains_named_node(node: &XmlNode, name: &str) -> bool {
+    node.name == name
+        || node
+            .children
+            .iter()
+            .any(|child| contains_named_node(child, name))
+}
+
+fn collect_calculation_texts(node: &XmlNode, output: &mut Vec<String>) {
+    if node.name == "Calculation" {
+        collect_text_nodes(node, output);
+    } else {
+        for child in &node.children {
+            collect_calculation_texts(child, output);
+        }
+    }
+}
+
+fn collect_text_nodes(node: &XmlNode, output: &mut Vec<String>) {
+    if node.name == "Text" && !node.text.trim().is_empty() {
+        output.push(node.text.clone());
+    }
+    for child in &node.children {
+        collect_text_nodes(child, output);
+    }
+}
+
+fn append_script_call_summaries(components: &mut [Component], edges: &[AnalysisEdge]) {
+    let calls: BTreeMap<&str, BTreeSet<&str>> = edges
+        .iter()
+        .filter(|edge| edge.kind == "calls_script" && edge.status == "explicit")
+        .filter_map(|edge| {
+            Some((
+                edge.from_object_id.as_deref()?,
+                edge.to_object_id.as_deref()?,
+            ))
+        })
+        .fold(BTreeMap::new(), |mut calls, (from, to)| {
+            calls.entry(from).or_default().insert(to);
+            calls
+        });
+    for script in components
+        .iter_mut()
+        .filter(|component| component.kind == "script")
+    {
+        let direct = calls
+            .get(script.object_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut reachable = BTreeSet::new();
+        let mut pending: VecDeque<_> = direct.iter().copied().collect();
+        let mut recursive = false;
+        while let Some(target) = pending.pop_front() {
+            if target == script.object_id {
+                recursive = true;
+            }
+            if reachable.insert(target) {
+                pending.extend(calls.get(target).into_iter().flatten().copied());
+            }
+        }
+        let evidence: Vec<_> = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls_script"
+                    && edge.status == "explicit"
+                    && edge.from_object_id.as_deref() == Some(script.object_id.as_str())
+            })
+            .flat_map(|edge| edge.evidence.iter().cloned())
+            .collect();
+        if !direct.is_empty() {
+            script.findings.push(AnalysisFinding {
+                kind: "script_call_summary".to_string(),
+                status: "derived".to_string(),
+                summary: format!("Calls {} distinct script(s) directly and reaches {} script(s) transitively", direct.len(), reachable.len()),
+                evidence: evidence.clone(),
+                limitations: vec!["Only resolved explicit script references are included; dynamic targets and execution conditions are excluded.".to_string()],
+            });
+        }
+        if recursive {
+            script.findings.push(AnalysisFinding {
+                kind: "recursive_script_call_candidate".to_string(),
+                status: "derived".to_string(),
+                summary: "The resolved script-call graph contains a path back to this script"
+                    .to_string(),
+                evidence,
+                limitations: vec![
+                    "Graph reachability does not prove that the recursive path executes."
+                        .to_string(),
+                ],
+            });
+        }
+        script.findings.sort_by(|left, right| {
+            left.evidence
+                .cmp(&right.evidence)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.summary.cmp(&right.summary))
+        });
+    }
 }
 
 pub fn analyze_component_references(components: &[Component]) -> Vec<AnalysisEdge> {
@@ -132,6 +406,171 @@ pub fn analyze_component_references(components: &[Component]) -> Vec<AnalysisEdg
         }
     }
     edges
+}
+
+pub fn discover_workflows(
+    components: &[Component],
+    edges: &[AnalysisEdge],
+) -> Vec<WorkflowCandidate> {
+    let mut objects = BTreeMap::new();
+    for component in components {
+        if component.source_action == "AddAction"
+            || !objects.contains_key(component.object_id.as_str())
+        {
+            objects.insert(component.object_id.as_str(), component);
+        }
+    }
+    let mut workflows = Vec::new();
+    for entry_edge in edges.iter().filter(|edge| {
+        matches!(
+            edge.kind.as_str(),
+            "triggers_script" | "is_triggered_by" | "navigates_to"
+        )
+    }) {
+        let (Some(entry_id), Some(entry)) = (
+            entry_edge.from_object_id.as_deref(),
+            entry_edge
+                .from_object_id
+                .as_deref()
+                .and_then(|object_id| objects.get(object_id).copied()),
+        ) else {
+            continue;
+        };
+        if !matches!(
+            entry.kind.as_str(),
+            "layout" | "layout_object" | "custom_menu"
+        ) {
+            continue;
+        }
+        let mut scripts = BTreeSet::new();
+        let mut layouts = BTreeSet::new();
+        let mut field_reads = BTreeSet::new();
+        let mut field_writes = BTreeSet::new();
+        let mut table_occurrences = BTreeSet::new();
+        let mut external_sources = BTreeSet::new();
+        let mut effects = BTreeSet::new();
+        let mut evidence: BTreeSet<String> = entry_edge.evidence.iter().cloned().collect();
+        let mut limitations = BTreeSet::from([
+            "This is a reachability summary; execution order, branch outcomes, and runtime context are not evaluated.".to_string(),
+        ]);
+        let mut unresolved = entry_edge.status == "unresolved";
+        let mut heuristic = entry_edge.status == "heuristic_candidate";
+        if let Some(parent_id) = entry.parent_object_id.as_deref() {
+            layouts.insert(parent_id.to_string());
+        }
+        if entry.kind == "layout" {
+            layouts.insert(entry_id.to_string());
+        }
+
+        let mut pending_scripts = VecDeque::new();
+        if entry_edge.kind != "navigates_to" {
+            if let Some(script_id) = entry_edge.to_object_id.as_deref() {
+                pending_scripts.push_back(script_id.to_string());
+            }
+        }
+        if entry_edge.kind == "navigates_to"
+            && let Some(layout_id) = entry_edge.to_object_id.as_deref()
+        {
+            layouts.insert(layout_id.to_string());
+        }
+
+        while let Some(script_id) = pending_scripts.pop_front() {
+            if !scripts.insert(script_id.clone()) {
+                continue;
+            }
+            if let Some(script) = objects.get(script_id.as_str()) {
+                for finding in script
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.kind == "step_effect")
+                {
+                    effects.insert(finding.summary.clone());
+                }
+            }
+            for edge in edges.iter().filter(|edge| {
+                edge.from_object_id.as_deref() == Some(script_id.as_str())
+                    && matches!(
+                        edge.kind.as_str(),
+                        "calls_script"
+                            | "navigates_to"
+                            | "reads_field"
+                            | "writes_field"
+                            | "uses_table_occurrence"
+                            | "accesses_external_source"
+                    )
+            }) {
+                evidence.extend(edge.evidence.iter().cloned());
+                if edge.status == "unresolved" {
+                    unresolved = true;
+                    limitations.insert(format!(
+                        "Unresolved {} reference remains in reachable script {}.",
+                        edge.kind, script_id
+                    ));
+                }
+                heuristic |= edge.status == "heuristic_candidate";
+                if edge.kind == "calls_script"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    pending_scripts.push_back(target.to_string());
+                } else if edge.kind == "navigates_to"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    layouts.insert(target.to_string());
+                } else if edge.kind == "reads_field"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    field_reads.insert(target.to_string());
+                } else if edge.kind == "writes_field"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    field_writes.insert(target.to_string());
+                } else if edge.kind == "uses_table_occurrence"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    table_occurrences.insert(target.to_string());
+                } else if edge.kind == "accesses_external_source"
+                    && let Some(target) = edge.to_object_id.as_deref()
+                {
+                    external_sources.insert(target.to_string());
+                }
+            }
+        }
+        let target_id = entry_edge.to_object_id.as_deref().unwrap_or("unresolved");
+        workflows.push(WorkflowCandidate {
+            id: format!("workflow:{entry_id}:{}:{target_id}", entry_edge.kind),
+            status: if unresolved {
+                "partially_unresolved".to_string()
+            } else if heuristic {
+                "heuristic_candidate".to_string()
+            } else {
+                "structurally_derived".to_string()
+            },
+            source_file: entry.source_file.clone(),
+            entry_object_id: entry_id.to_string(),
+            entry_name: if entry.name.trim().is_empty() {
+                format!(
+                    "{} {}",
+                    entry.kind,
+                    entry.xml_id.as_deref().unwrap_or(&entry.object_id)
+                )
+            } else {
+                entry.name.clone()
+            },
+            entry_kind: entry.kind.clone(),
+            script_ids: scripts.into_iter().collect(),
+            layout_ids: layouts.into_iter().collect(),
+            field_read_ids: field_reads.into_iter().collect(),
+            field_write_ids: field_writes.into_iter().collect(),
+            table_occurrence_ids: table_occurrences.into_iter().collect(),
+            external_source_ids: external_sources.into_iter().collect(),
+            effects: effects.into_iter().collect(),
+            evidence: evidence.into_iter().collect(),
+            limitations: limitations.into_iter().collect(),
+        });
+    }
+    workflows.sort_by(|left, right| left.id.cmp(&right.id));
+    workflows.dedup_by(|left, right| left.id == right.id);
+    workflows
 }
 
 fn append_tree_edges(
@@ -166,21 +605,16 @@ fn append_tree_edges(
         let evidence = format!("{source_path}/{}", path.join("/"));
         edges.push(AnalysisEdge {
             kind: kind.to_string(),
-            status: if target.is_some() {
-                "explicit"
-            } else {
-                "unresolved"
-            }
-            .to_string(),
+            status: resolution_status(target.as_ref(), source_identity(component), "explicit"),
             from_object_id: Some(component.object_id.clone()),
             to_object_id: target.as_ref().map(|symbol| symbol.object_id.clone()),
             from_record_id: Some(source_record_id.to_string()),
             to_record_id: target.as_ref().map(|symbol| symbol.record_id.clone()),
             evidence: vec![evidence],
-            limitations: if target.is_some() {
-                Vec::new()
-            } else {
-                vec!["The reference target is absent or ambiguous in this source file.".to_string()]
+            limitations: match target.as_ref() {
+                Some(target) if target.source_identity != source_identity(component) => vec!["Resolved by a unique UUID match across supplied files; confirm that the files represent linked FileMaker sources.".to_string()],
+                Some(_) => Vec::new(),
+                None => vec!["The reference target is absent or ambiguous in the supplied files.".to_string()],
             },
         });
     }
@@ -192,6 +626,97 @@ fn append_tree_edges(
         symbols,
         edges,
     );
+    append_textual_calculation_edges(
+        component,
+        root,
+        source_path,
+        source_record_id,
+        symbols,
+        edges,
+    );
+}
+
+fn append_textual_calculation_edges(
+    component: &Component,
+    root: &XmlNode,
+    source_path: &str,
+    source_record_id: &str,
+    symbols: &Symbols,
+    edges: &mut Vec<AnalysisEdge>,
+) {
+    let mut calculations = Vec::new();
+    collect_calculation_texts(root, &mut calculations);
+    for text in calculations {
+        for ((identity, qualified_name), targets) in &symbols.qualified_fields {
+            if identity != source_identity(component) || !contains_identifier(&text, qualified_name)
+            {
+                continue;
+            }
+            let target = match targets.as_slice() {
+                [target] => Some(target),
+                _ => None,
+            };
+            edges.push(AnalysisEdge {
+                kind: "reads_field".to_string(),
+                status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
+                from_object_id: Some(component.object_id.clone()),
+                to_object_id: target.map(|target| target.object_id.clone()),
+                from_record_id: Some(source_record_id.to_string()),
+                to_record_id: target.map(|target| target.record_id.clone()),
+                evidence: vec![format!("{source_path}/Calculation/Text (name match: {qualified_name})")],
+                limitations: vec!["This is a qualified-name match in calculation text; it may not resolve table-occurrence aliases or quoted identifiers. Prefer structured FieldReference chunks when available.".to_string()],
+            });
+        }
+        for ((identity, name), targets) in &symbols.custom_functions_by_name {
+            if identity != source_identity(component) || !contains_function_call(&text, name) {
+                continue;
+            }
+            let target = match targets.as_slice() {
+                [target] => Some(target),
+                _ => None,
+            };
+            edges.push(AnalysisEdge {
+                kind: "uses_custom_function".to_string(),
+                status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
+                from_object_id: Some(component.object_id.clone()),
+                to_object_id: target.map(|target| target.object_id.clone()),
+                from_record_id: Some(source_record_id.to_string()),
+                to_record_id: target.map(|target| target.record_id.clone()),
+                evidence: vec![format!("{source_path}/Calculation/Text (name match: {name})")],
+                limitations: vec!["This is a function-name match in calculation text; nested syntax and quoted function names are not parsed.".to_string()],
+            });
+        }
+    }
+}
+
+fn contains_identifier(text: &str, needle: &str) -> bool {
+    let text = text.to_lowercase();
+    let needle = needle.to_lowercase();
+    text.match_indices(&needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let identifier = |byte: Option<u8>| {
+            byte.is_some_and(|byte| byte >= 128 || byte.is_ascii_alphanumeric() || byte == b'_')
+        };
+        !identifier(
+            start
+                .checked_sub(1)
+                .and_then(|index| text.as_bytes().get(index).copied()),
+        ) && !identifier(text.as_bytes().get(end).copied())
+    })
+}
+
+fn contains_function_call(text: &str, name: &str) -> bool {
+    let text = text.to_lowercase();
+    let name = name.to_lowercase();
+    text.match_indices(&name).any(|(start, _)| {
+        let end = start + name.len();
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| text.as_bytes().get(index).copied());
+        let after = text[end..].trim_start();
+        !before.is_some_and(|byte| byte >= 128 || byte.is_ascii_alphanumeric() || byte == b'_')
+            && after.starts_with('(')
+    })
 }
 
 fn append_custom_function_edges(
@@ -215,12 +740,7 @@ fn append_custom_function_edges(
             });
         edges.push(AnalysisEdge {
             kind: "uses_custom_function".to_string(),
-            status: if target.is_some() {
-                "explicit"
-            } else {
-                "unresolved"
-            }
-            .to_string(),
+            status: resolution_status(target, source_identity(component), "explicit"),
             from_object_id: Some(component.object_id.clone()),
             to_object_id: target.map(|symbol| symbol.object_id.clone()),
             from_record_id: Some(source_record_id.to_string()),
@@ -260,11 +780,7 @@ fn collect_reference_edges(
         let target = target_kind.and_then(|target_kind| {
             resolve_reference(symbols, target_kind, source_identity(script), node)
         });
-        let status = if target.is_some() {
-            "explicit"
-        } else {
-            "unresolved"
-        };
+        let status = resolution_status(target.as_ref(), source_identity(script), "explicit");
         let evidence = format!("{} ({})", step.source_path, node.name);
         if target.is_none() {
             script.diagnostics.push(format!(
@@ -274,20 +790,28 @@ fn collect_reference_edges(
         }
         edges.push(AnalysisEdge {
             kind: kind.unwrap_or("references_object").to_string(),
-            status: status.to_string(),
+            status,
             from_object_id: Some(script.object_id.clone()),
             to_object_id: target.as_ref().map(|symbol| symbol.object_id.clone()),
             from_record_id: Some(step.record_id.clone()),
             to_record_id: target.as_ref().map(|symbol| symbol.record_id.clone()),
             evidence: vec![evidence],
-            limitations: if target.is_some() {
-                Vec::new()
-            } else {
-                vec!["The reference target is absent or ambiguous in this source file.".to_string()]
+            limitations: match target.as_ref() {
+                Some(target) if target.source_identity != source_identity(script) => vec!["Resolved by a unique UUID match across supplied files; confirm that the files represent linked FileMaker sources.".to_string()],
+                Some(_) => Vec::new(),
+                None => vec!["The reference target is absent or ambiguous in the supplied files.".to_string()],
             },
         });
     }
     append_custom_function_edges(
+        script,
+        &step.properties,
+        &step.source_path,
+        &step.record_id,
+        symbols,
+        edges,
+    );
+    append_textual_calculation_edges(
         script,
         &step.properties,
         &step.source_path,
@@ -337,7 +861,11 @@ fn collect_reference_paths<'a>(
     references: &mut Vec<(&'a XmlNode, Vec<String>)>,
 ) {
     path.push(node.name.clone());
-    if reference_component_kind(&node.name).is_some() {
+    if reference_component_kind(&node.name).is_some()
+        || (node.name == "DataSourceReference"
+            && node.attributes.get("type").map(String::as_str)
+                == Some("ExternalDataSourceReference"))
+    {
         references.push((node, path.clone()));
     }
     for child in &node.children {
@@ -379,6 +907,7 @@ fn reference_edge_kind(name: &str) -> Option<&'static str> {
         "CustomMenuSetReference" => Some("uses_custom_menu_set"),
         "ThemeReference" | "LayoutThemeReference" => Some("uses_theme"),
         "ExternalDataSourceReference" => Some("accesses_external_source"),
+        "DataSourceReference" => Some("accesses_external_source"),
         "BaseDirectoryReference" => Some("uses_base_directory"),
         "LibraryReference" => Some("uses_resource"),
         _ => None,
@@ -401,6 +930,7 @@ fn reference_component_kind(name: &str) -> Option<&'static str> {
         "CustomMenuSetReference" => Some("custom_menu_set"),
         "ThemeReference" | "LayoutThemeReference" => Some("theme"),
         "ExternalDataSourceReference" => Some("external_data_source"),
+        "DataSourceReference" => Some("external_data_source"),
         "BaseDirectoryReference" => Some("base_directory"),
         "LibraryReference" => Some("resource"),
         _ => None,
@@ -464,12 +994,14 @@ fn build_symbols(components: &[Component]) -> Symbols {
         by_uuid: BTreeMap::new(),
         by_id: BTreeMap::new(),
         custom_functions_by_name: BTreeMap::new(),
+        qualified_fields: BTreeMap::new(),
     };
     for component in components {
         let symbol = ObjectSymbol {
             object_id: component.object_id.clone(),
             record_id: component.record_id.clone(),
             xml_id: component.xml_id.clone(),
+            source_identity: source_identity(component).to_string(),
         };
         if let Some(uuid) = &component.xml_uuid {
             insert_symbol(
@@ -508,19 +1040,36 @@ fn build_symbols(components: &[Component]) -> Symbols {
                 .find(|entry| entry.object_id == symbol.object_id)
             {
                 if component.source_action == "AddAction" {
-                    *existing = symbol;
+                    *existing = symbol.clone();
                 }
             } else {
-                entries.push(symbol);
+                entries.push(symbol.clone());
             }
+        }
+        if component.kind == "field"
+            && let Some(table_name) = component.table_name.as_deref()
+        {
+            insert_symbol(
+                &mut symbols.qualified_fields,
+                (
+                    source_identity(component).to_string(),
+                    format!(
+                        "{}::{}",
+                        table_name.to_lowercase(),
+                        component.name.to_lowercase()
+                    ),
+                ),
+                symbol,
+                component.source_action == "AddAction",
+            );
         }
     }
     symbols
 }
 
-fn insert_symbol(
-    symbols: &mut BTreeMap<(String, String, String), Vec<ObjectSymbol>>,
-    key: (String, String, String),
+fn insert_symbol<K: Ord>(
+    symbols: &mut BTreeMap<K, Vec<ObjectSymbol>>,
+    key: K,
     symbol: ObjectSymbol,
     prefer: bool,
 ) {
@@ -545,27 +1094,64 @@ fn resolve_reference(
 ) -> Option<ObjectSymbol> {
     let uuid = reference.attributes.get("UUID");
     let xml_id = reference.attributes.get("id");
-    let matching = if let Some(uuid) = uuid {
-        symbols
-            .by_uuid
-            .get(&(source_identity.to_string(), kind.to_string(), uuid.clone()))?
+    let mut cross_file = false;
+    let matching = if let Some(uuid) = uuid.filter(|uuid| !uuid.is_empty()) {
+        if let Some(matching) =
+            symbols
+                .by_uuid
+                .get(&(source_identity.to_string(), kind.to_string(), uuid.clone()))
+        {
+            matching.as_slice()
+        } else {
+            cross_file = true;
+            let mut matches = symbols
+                .by_uuid
+                .iter()
+                .filter(|((_, candidate_kind, candidate_uuid), _)| {
+                    candidate_kind == kind && candidate_uuid == uuid
+                })
+                .flat_map(|(_, entries)| entries);
+            let first = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            std::slice::from_ref(first)
+        }
     } else {
         let xml_id = xml_id?;
-        symbols.by_id.get(&(
-            source_identity.to_string(),
-            kind.to_string(),
-            xml_id.clone(),
-        ))?
+        symbols
+            .by_id
+            .get(&(
+                source_identity.to_string(),
+                kind.to_string(),
+                xml_id.clone(),
+            ))?
+            .as_slice()
     };
-    if uuid.is_some()
+    if !cross_file
+        && uuid.is_some()
         && (matching.len() != 1
             || xml_id.is_some_and(|id| matching[0].xml_id.as_deref() != Some(id.as_str())))
     {
         return None;
     }
-    match matching.as_slice() {
+    match matching {
         [symbol] => Some(symbol.clone()),
         _ => None,
+    }
+}
+
+fn resolution_status(
+    target: Option<&ObjectSymbol>,
+    source_identity: &str,
+    local_status: &str,
+) -> String {
+    match target {
+        Some(target) if target.source_identity != source_identity => {
+            "heuristic_candidate".to_string()
+        }
+        Some(_) => local_status.to_string(),
+        None => "unresolved".to_string(),
     }
 }
 
@@ -585,6 +1171,17 @@ fn effect_for_step(name: &str) -> Option<&'static str> {
         "Export Records" => Some("record export"),
         "Send Mail" => Some("email sending"),
         "Open URL" => Some("opening a URL"),
+        "Insert from URL" => Some("fetching data from a URL"),
+        "Perform Script on Server" => Some("calling a server-side script"),
+        "Perform JavaScript in Web Viewer" => Some("executing JavaScript in a web viewer"),
+        "Set Web Viewer" => Some("changing web-viewer content"),
+        "Open File" => Some("opening a file"),
+        "Save Records as PDF" => Some("creating a PDF export"),
+        "Open Transaction" => Some("opening a transaction"),
+        "Commit Transaction" => Some("committing a transaction"),
+        "Revert Transaction" => Some("reverting a transaction"),
+        "Set Error Capture" => Some("changing FileMaker error-capture behavior"),
+        "Allow User Abort" => Some("changing user-abort behavior"),
         "Commit Records/Requests" => Some("committing records"),
         "Exit Script" | "Halt Script" => Some("script termination"),
         _ => None,

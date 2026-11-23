@@ -27,16 +27,19 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 |---|---|---|
 | Resolve explicit script references | Complete | Emits evidence-backed call edges; UUID is primary, conflicting IDs and missing/ambiguous targets remain unresolved. |
 | Analyze ordered steps | Complete | Recognizes basic effects, variable writes/calculation reads, disabled steps, If/Else/Loop control flow, and unreachable-step candidates. Scripts are never executed. |
-| Expand script semantics | Next | Improve parameter/result flow, direct and dynamic call summaries, recursion/cycles, error handling, and broader step effects with source evidence. |
+| Expand script semantics | Partial | Adds caller/callee parameter and result marker findings, resolved call reachability/cycle candidates, and more server/web/transaction/error-mode effects. Expression evaluation and parameter/result matching remain open. |
 
 ## In progress and future
 
 - First three coverage slices (initial implementation complete; broader fixture validation remains):
   1. Input: `analyze` accepts multiple XML paths or a directory of XML files, combines inventories and components, reports catalog counts per source file, and retains ID-bearing entries from unknown catalogs as raw objects. Format/version fixtures and split-export completeness rules remain open.
   2. References: explicit reference elements and structured field/custom-function calculation chunks in component properties, attached calculation records, and script steps resolve to same-file objects where identity is unambiguous; unresolved targets remain explicit. Calculation text parsing, cross-file references, and complete relationship semantics remain open.
-  3. UI/security: button/menu/layout-trigger script references and account privilege-set references produce typed edges; `security/permission-matrix.md` transcribes privilege-set categories and table-level record rules. Effective access, object-level access rows, and end-to-end validation remain open.
-- Next: expand script analysis and validate control-flow and reference edge cases against more fixtures.
-- Later: calculation/custom-function dependencies; complete layout/UI navigation; full privilege analysis; external integrations; workflow inference; migration contracts; versioned schemas; bounded agent context packages; and offline HTML documentation.
+  3. UI/security: button/menu/layout-trigger script references and account privilege-set references produce typed edges; `security/permission-matrix.md` includes table rules and explicit layout/script/value-list/field rows by source action. Effective permissions and full UI validation remain open.
+- Calculation text now produces candidate field/custom-function dependencies from qualified names; unique UUID matches across supplied files are marked heuristic. Formula syntax and FileMaker source identity still need validation.
+- Workflow candidates now link UI entries and resolved scripts, layouts, field reads/writes, table occurrences, and external sources. Script summaries include resolved call reachability, recursion candidates, and parameter/result markers.
+- Next: validate these expanded analyses against additional authentic exports, then finish expression-level dataflow, complete workflow navigation, and effective-access semantics where export completeness permits.
+- Integration/workflow slice: initial summaries now report external data sources, classified URL/email/import/export effects, and reachability-based workflow candidates in `integrations/` and `workflows/`. These are static evidence summaries, not validated endpoints or executed business processes.
+- Later: complete calculation/custom-function dependency parsing; full effective privilege analysis; migration contracts; versioned schemas; bounded agent context packages; and offline HTML documentation.
 - DDR support remains an optional decision after paired-export comparison; it must use a separate input adapter.
 - Preserve unsupported or ambiguous source constructs as diagnostics; do not infer a final application state from partial action records.
 - Sample-specific evidence and ranked gaps are tracked in [sample-analysis-gaps.md](sample-analysis-gaps.md). The current sample has no `DDR_INFO`; compare paired exports before deciding whether a separate DDR adapter adds required coverage.
