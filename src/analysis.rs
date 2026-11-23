@@ -26,6 +26,7 @@ struct ObjectSymbol {
 struct Symbols {
     by_uuid: BTreeMap<(String, String, String), Vec<ObjectSymbol>>,
     by_id: BTreeMap<(String, String, String), Vec<ObjectSymbol>>,
+    custom_functions_by_name: BTreeMap<(String, String), Vec<ObjectSymbol>>,
 }
 
 struct ControlBlocks {
@@ -102,6 +103,141 @@ pub fn analyze_scripts(components: &mut [Component]) -> Vec<AnalysisEdge> {
     edges
 }
 
+pub fn analyze_component_references(components: &[Component]) -> Vec<AnalysisEdge> {
+    let symbols = build_symbols(components);
+    let mut edges = Vec::new();
+    for component in components
+        .iter()
+        .filter(|component| component.kind != "script")
+    {
+        append_tree_edges(
+            component,
+            &component.properties,
+            &component.source_path,
+            &component.record_id,
+            None,
+            &symbols,
+            &mut edges,
+        );
+        for record in &component.attached_records {
+            append_tree_edges(
+                component,
+                &record.properties,
+                &record.source_path,
+                &record.record_id,
+                Some(&record.kind),
+                &symbols,
+                &mut edges,
+            );
+        }
+    }
+    edges
+}
+
+fn append_tree_edges(
+    component: &Component,
+    root: &XmlNode,
+    source_path: &str,
+    source_record_id: &str,
+    attached_kind: Option<&str>,
+    symbols: &Symbols,
+    edges: &mut Vec<AnalysisEdge>,
+) {
+    let mut references = Vec::new();
+    collect_reference_paths(root, &mut Vec::new(), &mut references);
+    for (node, path) in references {
+        if component.kind == "layout" && path.iter().any(|part| part == "LayoutObject") {
+            continue;
+        }
+        if matches!(
+            (attached_kind, node.name.as_str()),
+            (
+                Some("custom_function_calculation"),
+                "CustomFunctionReference"
+            ) | (Some("value_list_options"), "ValueListReference")
+        ) {
+            continue;
+        }
+        let Some(target_kind) = reference_component_kind(&node.name) else {
+            continue;
+        };
+        let target = resolve_reference(symbols, target_kind, source_identity(component), node);
+        let kind = component_reference_kind(component, &node.name, &path);
+        let evidence = format!("{source_path}/{}", path.join("/"));
+        edges.push(AnalysisEdge {
+            kind: kind.to_string(),
+            status: if target.is_some() {
+                "explicit"
+            } else {
+                "unresolved"
+            }
+            .to_string(),
+            from_object_id: Some(component.object_id.clone()),
+            to_object_id: target.as_ref().map(|symbol| symbol.object_id.clone()),
+            from_record_id: Some(source_record_id.to_string()),
+            to_record_id: target.as_ref().map(|symbol| symbol.record_id.clone()),
+            evidence: vec![evidence],
+            limitations: if target.is_some() {
+                Vec::new()
+            } else {
+                vec!["The reference target is absent or ambiguous in this source file.".to_string()]
+            },
+        });
+    }
+    append_custom_function_edges(
+        component,
+        root,
+        source_path,
+        source_record_id,
+        symbols,
+        edges,
+    );
+}
+
+fn append_custom_function_edges(
+    component: &Component,
+    root: &XmlNode,
+    source_path: &str,
+    source_record_id: &str,
+    symbols: &Symbols,
+    edges: &mut Vec<AnalysisEdge>,
+) {
+    let mut function_chunks = Vec::new();
+    collect_custom_function_chunks(root, &mut Vec::new(), &mut function_chunks);
+    for (chunk, path) in function_chunks {
+        let name = chunk.text.trim();
+        let target = symbols
+            .custom_functions_by_name
+            .get(&(source_identity(component).to_string(), name.to_string()))
+            .and_then(|matches| match matches.as_slice() {
+                [symbol] => Some(symbol),
+                _ => None,
+            });
+        edges.push(AnalysisEdge {
+            kind: "uses_custom_function".to_string(),
+            status: if target.is_some() {
+                "explicit"
+            } else {
+                "unresolved"
+            }
+            .to_string(),
+            from_object_id: Some(component.object_id.clone()),
+            to_object_id: target.map(|symbol| symbol.object_id.clone()),
+            from_record_id: Some(source_record_id.to_string()),
+            to_record_id: target.map(|symbol| symbol.record_id.clone()),
+            evidence: vec![format!("{source_path}/{}", path.join("/"))],
+            limitations: if target.is_some() {
+                Vec::new()
+            } else {
+                vec![
+                    "The custom function name is absent or ambiguous in this source file."
+                        .to_string(),
+                ]
+            },
+        });
+    }
+}
+
 fn collect_reference_edges(
     script: &mut Component,
     step: &AttachedRecord,
@@ -122,7 +258,7 @@ fn collect_reference_edges(
         };
         let target_kind = reference_component_kind(node.name.as_str());
         let target = target_kind.and_then(|target_kind| {
-            resolve_reference(symbols, target_kind, &script.source_file, node)
+            resolve_reference(symbols, target_kind, source_identity(script), node)
         });
         let status = if target.is_some() {
             "explicit"
@@ -151,6 +287,14 @@ fn collect_reference_edges(
             },
         });
     }
+    append_custom_function_edges(
+        script,
+        &step.properties,
+        &step.source_path,
+        &step.record_id,
+        symbols,
+        edges,
+    );
     if step.name == "Perform Script" && !has_script_reference {
         script.findings.push(AnalysisFinding {
             kind: "dynamic_script_call".to_string(),
@@ -187,6 +331,38 @@ fn collect_references<'a>(
     }
 }
 
+fn collect_reference_paths<'a>(
+    node: &'a XmlNode,
+    path: &mut Vec<String>,
+    references: &mut Vec<(&'a XmlNode, Vec<String>)>,
+) {
+    path.push(node.name.clone());
+    if reference_component_kind(&node.name).is_some() {
+        references.push((node, path.clone()));
+    }
+    for child in &node.children {
+        collect_reference_paths(child, path, references);
+    }
+    path.pop();
+}
+
+fn collect_custom_function_chunks<'a>(
+    node: &'a XmlNode,
+    path: &mut Vec<String>,
+    chunks: &mut Vec<(&'a XmlNode, Vec<String>)>,
+) {
+    path.push(node.name.clone());
+    if node.name == "Chunk"
+        && node.attributes.get("type").map(String::as_str) == Some("CustomFunctionRef")
+    {
+        chunks.push((node, path.clone()));
+    }
+    for child in &node.children {
+        collect_custom_function_chunks(child, path, chunks);
+    }
+    path.pop();
+}
+
 fn reference_edge_kind(name: &str) -> Option<&'static str> {
     match name {
         "ScriptReference" => Some("calls_script"),
@@ -195,6 +371,16 @@ fn reference_edge_kind(name: &str) -> Option<&'static str> {
         "ValueListReference" => Some("uses_value_list"),
         "CustomFunctionReference" => Some("uses_custom_function"),
         "LayoutReference" => Some("navigates_to"),
+        "BaseTableReference" => Some("references_table"),
+        "RelationshipReference" => Some("references_relationship"),
+        "PrivilegeSetReference" => Some("uses_privilege_set"),
+        "ExtendedPrivilegeReference" => Some("uses_extended_privilege"),
+        "CustomMenuReference" => Some("uses_custom_menu"),
+        "CustomMenuSetReference" => Some("uses_custom_menu_set"),
+        "ThemeReference" | "LayoutThemeReference" => Some("uses_theme"),
+        "ExternalDataSourceReference" => Some("accesses_external_source"),
+        "BaseDirectoryReference" => Some("uses_base_directory"),
+        "LibraryReference" => Some("uses_resource"),
         _ => None,
     }
 }
@@ -207,8 +393,63 @@ fn reference_component_kind(name: &str) -> Option<&'static str> {
         "ValueListReference" => Some("value_list"),
         "CustomFunctionReference" => Some("custom_function"),
         "LayoutReference" => Some("layout"),
+        "BaseTableReference" => Some("table"),
+        "RelationshipReference" => Some("relationship"),
+        "PrivilegeSetReference" => Some("privilege_set"),
+        "ExtendedPrivilegeReference" => Some("extended_privilege"),
+        "CustomMenuReference" => Some("custom_menu"),
+        "CustomMenuSetReference" => Some("custom_menu_set"),
+        "ThemeReference" | "LayoutThemeReference" => Some("theme"),
+        "ExternalDataSourceReference" => Some("external_data_source"),
+        "BaseDirectoryReference" => Some("base_directory"),
+        "LibraryReference" => Some("resource"),
         _ => None,
     }
+}
+
+fn component_reference_kind(
+    component: &Component,
+    reference: &str,
+    path: &[String],
+) -> &'static str {
+    match (component.kind.as_str(), reference) {
+        ("account", "PrivilegeSetReference") => "uses_privilege_set",
+        ("layout" | "layout_object", "ScriptReference")
+            if path.iter().any(|part| part == "ScriptTriggers") =>
+        {
+            "is_triggered_by"
+        }
+        ("layout_object", "ScriptReference")
+            if path
+                .iter()
+                .any(|part| matches!(part.as_str(), "Button" | "ButtonBar" | "action")) =>
+        {
+            "triggers_script"
+        }
+        ("custom_menu", "ScriptReference") => "triggers_script",
+        (
+            "privilege_set",
+            "BaseTableReference"
+            | "TableOccurrenceReference"
+            | "FieldReference"
+            | "LayoutReference"
+            | "ScriptReference"
+            | "ValueListReference",
+        ) => "has_access_rule_for",
+        (_, "ScriptReference") => "references_script",
+        ("layout_object", "LayoutReference") => "navigates_to",
+        (_, "FieldReference") => "references_field",
+        (_, _) => reference_edge_kind(reference).unwrap_or("references_object"),
+    }
+}
+
+fn source_identity(component: &Component) -> &str {
+    component
+        .object_id
+        .split(':')
+        .next()
+        .filter(|identity| !identity.is_empty())
+        .unwrap_or(&component.source_file)
 }
 
 fn step_reference_kind(step_name: &str) -> Option<&'static str> {
@@ -222,6 +463,7 @@ fn build_symbols(components: &[Component]) -> Symbols {
     let mut symbols = Symbols {
         by_uuid: BTreeMap::new(),
         by_id: BTreeMap::new(),
+        custom_functions_by_name: BTreeMap::new(),
     };
     for component in components {
         let symbol = ObjectSymbol {
@@ -233,7 +475,7 @@ fn build_symbols(components: &[Component]) -> Symbols {
             insert_symbol(
                 &mut symbols.by_uuid,
                 (
-                    component.source_file.clone(),
+                    source_identity(component).to_string(),
                     component.kind.clone(),
                     uuid.clone(),
                 ),
@@ -245,13 +487,32 @@ fn build_symbols(components: &[Component]) -> Symbols {
             insert_symbol(
                 &mut symbols.by_id,
                 (
-                    component.source_file.clone(),
+                    source_identity(component).to_string(),
                     component.kind.clone(),
                     id.clone(),
                 ),
-                symbol,
+                symbol.clone(),
                 component.source_action == "AddAction",
             );
+        }
+        if component.kind == "custom_function" {
+            let entries = symbols
+                .custom_functions_by_name
+                .entry((
+                    source_identity(component).to_string(),
+                    component.name.clone(),
+                ))
+                .or_default();
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|entry| entry.object_id == symbol.object_id)
+            {
+                if component.source_action == "AddAction" {
+                    *existing = symbol;
+                }
+            } else {
+                entries.push(symbol);
+            }
         }
     }
     symbols
@@ -279,7 +540,7 @@ fn insert_symbol(
 fn resolve_reference(
     symbols: &Symbols,
     kind: &str,
-    source_file: &str,
+    source_identity: &str,
     reference: &XmlNode,
 ) -> Option<ObjectSymbol> {
     let uuid = reference.attributes.get("UUID");
@@ -287,12 +548,14 @@ fn resolve_reference(
     let matching = if let Some(uuid) = uuid {
         symbols
             .by_uuid
-            .get(&(source_file.to_string(), kind.to_string(), uuid.clone()))?
+            .get(&(source_identity.to_string(), kind.to_string(), uuid.clone()))?
     } else {
         let xml_id = xml_id?;
-        symbols
-            .by_id
-            .get(&(source_file.to_string(), kind.to_string(), xml_id.clone()))?
+        symbols.by_id.get(&(
+            source_identity.to_string(),
+            kind.to_string(),
+            xml_id.clone(),
+        ))?
     };
     if uuid.is_some()
         && (matching.len() != 1

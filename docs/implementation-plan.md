@@ -31,9 +31,15 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 
 ## In progress and future
 
-- Next: expand script analysis and validate control-flow edge cases against more fixtures.
-- Later: calculation/custom-function references; layout/UI navigation; privilege analysis; external integrations; workflow inference; migration contracts and offline HTML documentation.
+- First three coverage slices (initial implementation complete; broader fixture validation remains):
+  1. Input: `analyze` accepts multiple XML paths or a directory of XML files, combines inventories and components, reports catalog counts per source file, and retains ID-bearing entries from unknown catalogs as raw objects. Format/version fixtures and split-export completeness rules remain open.
+  2. References: explicit reference elements and structured field/custom-function calculation chunks in component properties, attached calculation records, and script steps resolve to same-file objects where identity is unambiguous; unresolved targets remain explicit. Calculation text parsing, cross-file references, and complete relationship semantics remain open.
+  3. UI/security: button/menu/layout-trigger script references and account privilege-set references produce typed edges; `security/permission-matrix.md` transcribes privilege-set categories and table-level record rules. Effective access, object-level access rows, and end-to-end validation remain open.
+- Next: expand script analysis and validate control-flow and reference edge cases against more fixtures.
+- Later: calculation/custom-function dependencies; complete layout/UI navigation; full privilege analysis; external integrations; workflow inference; migration contracts; versioned schemas; bounded agent context packages; and offline HTML documentation.
+- DDR support remains an optional decision after paired-export comparison; it must use a separate input adapter.
 - Preserve unsupported or ambiguous source constructs as diagnostics; do not infer a final application state from partial action records.
+- Sample-specific evidence and ranked gaps are tracked in [sample-analysis-gaps.md](sample-analysis-gaps.md). The current sample has no `DDR_INFO`; compare paired exports before deciding whether a separate DDR adapter adds required coverage.
 
 ## Verification
 

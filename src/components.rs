@@ -7,6 +7,26 @@ use anyhow::{Result, bail};
 use quick_xml::{Reader, XmlVersion, encoding::DecodingReader, events::Event};
 use serde::Serialize;
 
+const KNOWN_CATALOGS: &[&str] = &[
+    "AccountsCatalog",
+    "BaseDirectoryCatalog",
+    "BaseTableCatalog",
+    "CustomFunctionsCatalog",
+    "CustomMenuCatalog",
+    "CustomMenuSetCatalog",
+    "ExtendedPrivilegesCatalog",
+    "ExternalDataSourceCatalog",
+    "FieldCatalog",
+    "LayoutCatalog",
+    "LibraryCatalog",
+    "PrivilegeSetsCatalog",
+    "RelationshipCatalog",
+    "ScriptCatalog",
+    "TableOccurrenceCatalog",
+    "ThemeCatalog",
+    "ValueListCatalog",
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Component {
     pub record_id: String,
@@ -70,6 +90,7 @@ struct FieldCatalogContext {
 struct CaptureContext {
     kind: &'static str,
     catalog: &'static str,
+    catalog_name: Option<String>,
     action: String,
     source_file: String,
     table_id: Option<String>,
@@ -123,12 +144,17 @@ pub fn extract_data_model<R: Read>(source: R) -> Result<Vec<Component>> {
                 }
 
                 if capture.is_empty() {
-                    if let Some((kind, catalog)) = component_kind(&name, &path) {
+                    if let Some((kind, catalog)) = component_kind(&name, &attrs, &path) {
                         object_ordinal += 1;
                         let field_context = field_catalogs.last();
                         capture_context = Some(CaptureContext {
                             kind,
                             catalog,
+                            catalog_name: (kind == "unknown_catalog_item").then(|| {
+                                unknown_catalog_name(&path)
+                                    .unwrap_or("UnknownCatalog")
+                                    .to_string()
+                            }),
                             action: current_action(&path),
                             source_file: source_file.clone(),
                             table_id: if kind == "field" {
@@ -179,12 +205,17 @@ pub fn extract_data_model<R: Read>(source: R) -> Result<Vec<Component>> {
                     context.table_name = attrs.get("name").cloned();
                 }
                 if capture.is_empty() {
-                    if let Some((kind, catalog)) = component_kind(&name, &path) {
+                    if let Some((kind, catalog)) = component_kind(&name, &attrs, &path) {
                         object_ordinal += 1;
                         let field_context = field_catalogs.last();
                         let context = CaptureContext {
                             kind,
                             catalog,
+                            catalog_name: (kind == "unknown_catalog_item").then(|| {
+                                unknown_catalog_name(&path)
+                                    .unwrap_or("UnknownCatalog")
+                                    .to_string()
+                            }),
                             action: current_action(&path),
                             source_file: source_file.clone(),
                             table_id: if kind == "field" {
@@ -403,7 +434,11 @@ impl XmlNode {
     }
 }
 
-fn component_kind(name: &str, path: &[String]) -> Option<(&'static str, &'static str)> {
+fn component_kind(
+    name: &str,
+    attributes: &BTreeMap<String, String>,
+    path: &[String],
+) -> Option<(&'static str, &'static str)> {
     if name.ends_with("Reference") && current_action(path) != "RemoveAction" {
         return None;
     }
@@ -448,7 +483,7 @@ fn component_kind(name: &str, path: &[String]) -> Option<(&'static str, &'static
             ("ExtendedPrivilegesCatalog", "extended_privilege")
         }
         "Account" | "AccountReference" => ("AccountsCatalog", "account"),
-        _ => return None,
+        _ => return unknown_catalog_component(attributes, path),
     };
     let parent_catalog = if path.last().map(String::as_str) == Some("ObjectList") {
         path.iter().rev().nth(1).map(String::as_str)
@@ -456,9 +491,27 @@ fn component_kind(name: &str, path: &[String]) -> Option<(&'static str, &'static
         path.last().map(String::as_str)
     };
     if parent_catalog != Some(catalog) {
-        return None;
+        return unknown_catalog_component(attributes, path);
     }
     Some((kind, catalog))
+}
+
+fn unknown_catalog_component(
+    attributes: &BTreeMap<String, String>,
+    path: &[String],
+) -> Option<(&'static str, &'static str)> {
+    let catalog = unknown_catalog_name(path)?;
+    (attributes.contains_key("id") && !KNOWN_CATALOGS.contains(&catalog))
+        .then_some(("unknown_catalog_item", "UnknownCatalog"))
+}
+
+fn unknown_catalog_name(path: &[String]) -> Option<&str> {
+    let catalog = if path.last().map(String::as_str) == Some("ObjectList") {
+        path.iter().rev().nth(1).map(String::as_str)
+    } else {
+        path.last().map(String::as_str)
+    }?;
+    catalog.ends_with("Catalog").then_some(catalog)
 }
 
 fn current_action(path: &[String]) -> String {
@@ -484,6 +537,8 @@ fn component_from_node(properties: XmlNode, context: CaptureContext, file_uuid: 
         .unwrap_or_else(|| format!("entry-{}", context.ordinal));
     let kind_id = if context.kind == "field" {
         context.table_id.as_deref().unwrap_or("unscoped")
+    } else if context.kind == "unknown_catalog_item" {
+        context.catalog_name.as_deref().unwrap_or("unknown-catalog")
     } else {
         "file"
     };
@@ -542,7 +597,15 @@ fn component_from_node(properties: XmlNode, context: CaptureContext, file_uuid: 
                     .map(|identity| (reference_name, identity))
             })
     });
-    let source_path = if let Some((reference_name, identity)) = detached_reference {
+    let source_path = if context.kind == "unknown_catalog_item" {
+        format!(
+            "/FMSaveAsXML/Structure/{}/{}/{}[id={}]",
+            context.action,
+            context.catalog_name.as_deref().unwrap_or("UnknownCatalog"),
+            properties.name,
+            xml_id.as_deref().unwrap_or(&identity)
+        )
+    } else if let Some((reference_name, identity)) = detached_reference {
         format!(
             "/FMSaveAsXML/Structure/{}/{catalog}[{reference_name}={identity}]",
             context.action

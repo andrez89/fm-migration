@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 mod analysis;
 mod components;
-use analysis::{AnalysisEdge, analyze_scripts};
-use components::{Component, extract_data_model};
+use analysis::{AnalysisEdge, analyze_component_references, analyze_scripts};
+use components::{Component, XmlNode, extract_data_model};
 use quick_xml::{Reader, XmlVersion, encoding::DecodingReader, events::Event};
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ const KNOWN_CATALOGS: &[&str] = &[
 #[derive(Parser)]
 #[command(
     name = "fmblueprint",
-    about = "Inventory a Claris FileMaker Save a Copy as XML export"
+    about = "Analyze Claris FileMaker Save a Copy as XML exports"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,7 +47,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Analyze {
-        input: Option<PathBuf>,
+        #[arg(value_name = "INPUT", num_args = 0..)]
+        input: Vec<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -57,9 +58,7 @@ enum Commands {
 struct Inventory {
     schema_version: u32,
     source_format: String,
-    input_encoding: String,
-    application: Application,
-    ddr_info_present: bool,
+    applications: Vec<Application>,
     catalogs: Vec<Catalog>,
     known_catalogs_not_observed: Vec<String>,
     diagnostics: Vec<String>,
@@ -72,10 +71,13 @@ struct Application {
     export_version: Option<String>,
     filemaker_version: Option<String>,
     locale: Option<String>,
+    input_encoding: String,
+    ddr_info_present: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
 struct Catalog {
+    source_file: String,
     action: String,
     name: String,
     occurrences: u64,
@@ -84,6 +86,7 @@ struct Catalog {
 }
 
 struct CatalogScope {
+    source_file: String,
     action: String,
     name: String,
     declared_member_count: Option<u64>,
@@ -93,7 +96,7 @@ struct CatalogScope {
 #[derive(Default)]
 struct ParsedXml {
     application: Option<Application>,
-    catalogs: BTreeMap<(String, String), Catalog>,
+    catalogs: BTreeMap<(String, String, String), Catalog>,
     ddr_info_present: bool,
     unknown_catalogs: Vec<String>,
 }
@@ -120,29 +123,31 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Analyze { input, out }) => run_analysis(input, out),
-        None if io::stdin().is_terminal() => run_analysis(None, None),
+        None if io::stdin().is_terminal() => run_analysis(Vec::new(), None),
         None => {
             let mut command = Cli::command();
             command.print_help()?;
             println!();
             bail!(
-                "use `fmblueprint analyze <xml> [--out <directory>]` outside an interactive terminal"
+                "use `fmblueprint analyze <xml-or-directory>... [--out <directory>]` outside an interactive terminal"
             )
         }
     }
 }
 
-fn run_analysis(input: Option<PathBuf>, output: Option<PathBuf>) -> Result<()> {
-    if input.is_none() && !io::stdin().is_terminal() {
+fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
+    if inputs.is_empty() && !io::stdin().is_terminal() {
         bail!(
-            "XML input is required outside an interactive terminal; use `fmblueprint analyze <xml> [--out <directory>]`"
+            "XML input is required outside an interactive terminal; use `fmblueprint analyze <xml-or-directory>... [--out <directory>]`"
         )
     }
-    let input = match input {
-        Some(input) => input,
-        None => prompt_path("FileMaker XML input path: ", None)?,
+    let inputs = if inputs.is_empty() {
+        vec![prompt_path("FileMaker XML input path: ", None)?]
+    } else {
+        inputs
     };
-    let default_output = default_output_dir(&input);
+    let inputs = expand_xml_inputs(&inputs)?;
+    let default_output = default_output_dir(&inputs);
     let output = match output {
         Some(output) => output,
         None if io::stdin().is_terminal() => {
@@ -150,15 +155,64 @@ fn run_analysis(input: Option<PathBuf>, output: Option<PathBuf>) -> Result<()> {
         }
         None => default_output,
     };
-    let encoding = detect_encoding(&input)?;
-    let file =
-        File::open(&input).with_context(|| format!("cannot open XML input {}", input.display()))?;
-    let parsed = parse_xml(file)?;
-    let inventory = finish_inventory(parsed, encoding)?;
-    let component_source = File::open(&input)
-        .with_context(|| format!("cannot reopen XML input {}", input.display()))?;
-    let mut components = extract_data_model(component_source)?;
-    let edges = analyze_scripts(&mut components);
+    let mut applications = Vec::new();
+    let mut catalogs: BTreeMap<(String, String, String), Catalog> = BTreeMap::new();
+    let mut known_catalogs_not_observed = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut components = Vec::new();
+    for input in &inputs {
+        let encoding = detect_encoding(input)?;
+        let file = File::open(input)
+            .with_context(|| format!("cannot open XML input {}", input.display()))?;
+        let parsed = parse_xml(file)?;
+        let inventory = finish_inventory(parsed, encoding)?;
+        applications.extend(inventory.applications);
+        for catalog in inventory.catalogs {
+            let key = (
+                catalog.source_file.clone(),
+                catalog.action.clone(),
+                catalog.name.clone(),
+            );
+            let total = catalogs.entry(key).or_insert_with(|| Catalog {
+                source_file: catalog.source_file,
+                action: catalog.action,
+                name: catalog.name,
+                ..Catalog::default()
+            });
+            total.occurrences += catalog.occurrences;
+            total.observed_entries += catalog.observed_entries;
+            if let Some(count) = catalog.declared_member_count {
+                *total.declared_member_count.get_or_insert(0) += count;
+            }
+        }
+        known_catalogs_not_observed.extend(inventory.known_catalogs_not_observed);
+        diagnostics.extend(inventory.diagnostics);
+        let component_source = File::open(input)
+            .with_context(|| format!("cannot reopen XML input {}", input.display()))?;
+        components.extend(extract_data_model(component_source)?);
+    }
+    applications.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    let catalogs = catalogs.into_values().collect();
+    known_catalogs_not_observed.sort();
+    diagnostics.sort();
+    let inventory = Inventory {
+        schema_version: 2,
+        source_format: "FMSaveAsXML".to_string(),
+        applications,
+        catalogs,
+        known_catalogs_not_observed,
+        diagnostics,
+    };
+    let mut edges = analyze_scripts(&mut components);
+    edges.extend(analyze_component_references(&components));
+    edges.sort_by(|left, right| {
+        left.from_record_id
+            .cmp(&right.from_record_id)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.to_object_id.cmp(&right.to_object_id))
+            .then(left.to_record_id.cmp(&right.to_record_id))
+            .then(left.evidence.cmp(&right.evidence))
+    });
 
     fs::create_dir_all(&output)
         .with_context(|| format!("cannot create output directory {}", output.display()))?;
@@ -183,6 +237,7 @@ fn run_analysis(input: Option<PathBuf>, output: Option<PathBuf>) -> Result<()> {
         })?,
     )?;
     write_component_docs(&output, &components, &edges)?;
+    write_permission_matrix(&output, &components)?;
     println!("Inventory written to {}", output.display());
     Ok(())
 }
@@ -202,9 +257,50 @@ fn prompt_path(prompt: &str, default: Option<&Path>) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
-fn default_output_dir(input: &Path) -> PathBuf {
-    let name = input
-        .file_stem()
+fn expand_xml_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        if input.is_dir() {
+            for entry in fs::read_dir(input)
+                .with_context(|| format!("cannot read input directory {}", input.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_file()
+                    && path.extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("xml")
+                    })
+                {
+                    paths.push(path);
+                }
+            }
+        } else {
+            paths.push(input.clone());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        bail!("no XML files found in the supplied input")
+    }
+    Ok(paths)
+}
+
+fn default_output_dir(inputs: &[PathBuf]) -> PathBuf {
+    if let [input] = inputs {
+        let name = input
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("filemaker-app");
+        return PathBuf::from("output").join(name);
+    }
+    let common_parent = inputs
+        .first()
+        .and_then(|first| first.parent())
+        .filter(|parent| inputs.iter().all(|input| input.parent() == Some(*parent)));
+    let name = common_parent
+        .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("filemaker-app");
@@ -232,6 +328,7 @@ fn parse_xml<R: Read>(source: R) -> Result<ParsedXml> {
     let mut stack: Vec<String> = Vec::new();
     let mut catalogs: Vec<CatalogScope> = Vec::new();
     let mut parsed = ParsedXml::default();
+    let mut source_file = String::from("unknown-file");
     let mut root_seen = false;
 
     loop {
@@ -245,6 +342,11 @@ fn parse_xml<R: Read>(source: R) -> Result<ParsedXml> {
                     }
                     root_seen = true;
                     parsed.application = Some(application(&attrs));
+                    source_file = parsed
+                        .application
+                        .as_ref()
+                        .and_then(|application| application.file_name.clone())
+                        .unwrap_or_else(|| "unknown-file".to_string());
                 }
                 if name == "DDR_INFO" {
                     parsed.ddr_info_present = true;
@@ -263,6 +365,7 @@ fn parse_xml<R: Read>(source: R) -> Result<ParsedXml> {
                         parsed.unknown_catalogs.push(name.clone());
                     }
                     catalogs.push(CatalogScope {
+                        source_file: source_file.clone(),
                         action,
                         name: name.clone(),
                         declared_member_count: attrs
@@ -282,6 +385,11 @@ fn parse_xml<R: Read>(source: R) -> Result<ParsedXml> {
                     }
                     root_seen = true;
                     parsed.application = Some(application(&attrs));
+                    source_file = parsed
+                        .application
+                        .as_ref()
+                        .and_then(|application| application.file_name.clone())
+                        .unwrap_or_else(|| "unknown-file".to_string());
                 }
                 if name == "DDR_INFO" {
                     parsed.ddr_info_present = true;
@@ -302,6 +410,7 @@ fn parse_xml<R: Read>(source: R) -> Result<ParsedXml> {
                     merge_catalog(
                         &mut parsed.catalogs,
                         CatalogScope {
+                            source_file: source_file.clone(),
                             action,
                             name,
                             declared_member_count: attrs
@@ -363,6 +472,8 @@ fn application(attrs: &BTreeMap<String, String>) -> Application {
         export_version: attrs.get("version").cloned(),
         filemaker_version: attrs.get("Source").cloned(),
         locale: attrs.get("locale").cloned(),
+        input_encoding: String::new(),
+        ddr_info_present: false,
     }
 }
 
@@ -419,9 +530,14 @@ fn catalog_entry_name(catalog: &str) -> Option<&'static str> {
     })
 }
 
-fn merge_catalog(catalogs: &mut BTreeMap<(String, String), Catalog>, scope: CatalogScope) {
-    let key = (scope.action.clone(), scope.name.clone());
+fn merge_catalog(catalogs: &mut BTreeMap<(String, String, String), Catalog>, scope: CatalogScope) {
+    let key = (
+        scope.source_file.clone(),
+        scope.action.clone(),
+        scope.name.clone(),
+    );
     let catalog = catalogs.entry(key).or_insert_with(|| Catalog {
+        source_file: scope.source_file,
         action: scope.action,
         name: scope.name,
         ..Catalog::default()
@@ -434,10 +550,13 @@ fn merge_catalog(catalogs: &mut BTreeMap<(String, String), Catalog>, scope: Cata
 }
 
 fn finish_inventory(mut parsed: ParsedXml, input_encoding: String) -> Result<Inventory> {
-    let application = parsed
+    let mut application = parsed
         .application
         .take()
         .context("missing FileMaker file metadata")?;
+    application.input_encoding = input_encoding;
+    application.ddr_info_present = parsed.ddr_info_present;
+    let source_file = application.file_name.as_deref().unwrap_or("unknown-file");
     let present: Vec<&str> = parsed
         .catalogs
         .values()
@@ -446,7 +565,7 @@ fn finish_inventory(mut parsed: ParsedXml, input_encoding: String) -> Result<Inv
     let mut not_observed: Vec<String> = KNOWN_CATALOGS
         .iter()
         .filter(|name| !present.contains(name))
-        .map(|name| (*name).to_string())
+        .map(|name| format!("{source_file}: {name}"))
         .collect();
     not_observed.sort();
     parsed.unknown_catalogs.sort();
@@ -455,7 +574,7 @@ fn finish_inventory(mut parsed: ParsedXml, input_encoding: String) -> Result<Inv
         .unknown_catalogs
         .iter()
         .map(|name| {
-            format!("Unrecognized catalog <{name}> was recorded; entry counts use recognized entry elements when available.")
+            format!("{source_file}: unrecognized catalog <{name}> was recorded; entry counts use recognized entry elements when available.")
         })
         .collect();
     if !not_observed.is_empty() {
@@ -465,11 +584,9 @@ fn finish_inventory(mut parsed: ParsedXml, input_encoding: String) -> Result<Inv
         ));
     }
     Ok(Inventory {
-        schema_version: 1,
+        schema_version: 2,
         source_format: "FMSaveAsXML".to_string(),
-        input_encoding,
-        application,
-        ddr_info_present: parsed.ddr_info_present,
+        applications: vec![application],
         catalogs: parsed.catalogs.into_values().collect(),
         known_catalogs_not_observed: not_observed,
         diagnostics,
@@ -477,27 +594,39 @@ fn finish_inventory(mut parsed: ParsedXml, input_encoding: String) -> Result<Inv
 }
 
 fn render_markdown(inventory: &Inventory) -> String {
-    let app = &inventory.application;
-    let title = app.file_name.as_deref().unwrap_or("FileMaker application");
+    let title = inventory
+        .applications
+        .first()
+        .and_then(|app| app.file_name.as_deref())
+        .unwrap_or("FileMaker application");
     let mut markdown = format!(
-        "# FileMaker inventory: {}\n\n- Source format: {}\n- Export version: {}\n- FileMaker version: {}\n- Locale: {}\n- Input encoding: {}\n- DDR_INFO: {}\n- Application UUID: {}\n\n",
+        "# FileMaker inventory: {}\n\n- Source format: {}\n- Input files: {}\n\n",
         md(title),
         inventory.source_format,
-        md_or_dash(app.export_version.as_deref()),
-        md_or_dash(app.filemaker_version.as_deref()),
-        md_or_dash(app.locale.as_deref()),
-        inventory.input_encoding,
-        if inventory.ddr_info_present {
-            "present"
-        } else {
-            "not present"
-        },
-        md_or_dash(app.uuid.as_deref()),
+        inventory.applications.len()
     );
-    markdown.push_str("## Catalog inventory\n\n| Action | Catalog | Occurrences | Declared members | Observed entries |\n|---|---|---:|---:|---:|\n");
+    markdown.push_str("## Applications\n\n| File | UUID | Export version | FileMaker version | Locale | Encoding | DDR_INFO |\n|---|---|---|---|---|---|---|\n");
+    for app in &inventory.applications {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            md_or_dash(app.file_name.as_deref()),
+            md_or_dash(app.uuid.as_deref()),
+            md_or_dash(app.export_version.as_deref()),
+            md_or_dash(app.filemaker_version.as_deref()),
+            md_or_dash(app.locale.as_deref()),
+            md(&app.input_encoding),
+            if app.ddr_info_present {
+                "present"
+            } else {
+                "not present"
+            },
+        ));
+    }
+    markdown.push_str("\n## Catalog inventory\n\n| File | Action | Catalog | Occurrences | Declared members | Observed entries |\n|---|---|---|---:|---:|---:|\n");
     for catalog in &inventory.catalogs {
         markdown.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
+            md(&catalog.source_file),
             md(&catalog.action),
             md(&catalog.name),
             catalog.occurrences,
@@ -523,9 +652,9 @@ fn render_markdown(inventory: &Inventory) -> String {
         }
         markdown.push('\n');
     }
-    markdown.push_str("## Coverage\n\nCatalog inventory reports source entries by action. Component pages preserve available XML properties for extracted catalogs; account names and privilege-set roles are included, while passwords and credentials are redacted. References are not semantically resolved, and runtime behavior is not inferred.\n");
+    markdown.push_str("## Coverage\n\nCatalog inventory reports source entries by file and action. Component pages preserve available XML properties for extracted catalogs; account names and privilege-set roles are included, while passwords and credentials are redacted. Explicit references are resolved where the target is present and unambiguous; runtime behavior is not inferred.\n");
     markdown
-        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json)\n");
+        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json) · [Permission matrix](security/permission-matrix.md)\n");
     markdown
 }
 
@@ -595,6 +724,192 @@ fn write_component_docs(
         })?,
     )?;
     Ok(())
+}
+
+fn write_permission_matrix(output: &Path, components: &[Component]) -> Result<()> {
+    let directory = output.join("security");
+    fs::create_dir_all(&directory)?;
+    let mut markdown = String::from(
+        "# Exported access matrix\n\nThis report transcribes access settings present in each privilege-set source record. It does not merge Add/Modify actions or prove effective runtime access. `Calculation` means access is conditional; the calculation is preserved on the linked privilege-set page.\n\n## General access settings\n\n| File | Action | Privilege set | Account names | Category | Settings | Evidence |\n|---|---|---|---|---|---|---|\n",
+    );
+    let privilege_sets: Vec<_> = components
+        .iter()
+        .filter(|component| component.kind == "privilege_set")
+        .collect();
+    for privilege_set in &privilege_sets {
+        let accounts = accounts_for_privilege_set(privilege_set, components);
+        let mut access_nodes = Vec::new();
+        collect_named_nodes(&privilege_set.properties, "access", &mut access_nodes);
+        for access in &access_nodes {
+            for section in &access.children {
+                markdown.push_str(&format!(
+                    "| {} | {} | [{}](../objects/{}) | {} | {} | {} | `{}` |\n",
+                    md(&privilege_set.source_file),
+                    md(&privilege_set.source_action),
+                    md(&privilege_set.name),
+                    component_page_relative_path(privilege_set, components),
+                    md(if accounts.is_empty() {
+                        "—"
+                    } else {
+                        accounts.as_str()
+                    }),
+                    md(&section.name),
+                    md(&format_access_section(section)),
+                    md(&privilege_set.source_path),
+                ));
+            }
+        }
+    }
+    if privilege_sets.is_empty() {
+        markdown.push_str("\nNo privilege-set records were present in the supplied exports.\n");
+    } else {
+        markdown.push_str("\n## Table record rules\n\n| File | Action | Privilege set | Account names | Table | View | Edit | Create | Delete | Fields | Evidence |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for privilege_set in &privilege_sets {
+            let mut access_nodes = Vec::new();
+            collect_named_nodes(&privilege_set.properties, "access", &mut access_nodes);
+            let accounts = accounts_for_privilege_set(privilege_set, components);
+            let mut table_nodes = Vec::new();
+            for access in &access_nodes {
+                collect_named_nodes(access, "Table", &mut table_nodes);
+            }
+            for table in table_nodes {
+                let reference = first_named_node(table, "BaseTableReference")
+                    .or_else(|| first_named_node(table, "TableOccurrenceReference"));
+                let target = reference
+                    .and_then(|reference| reference.attributes.get("name"))
+                    .cloned()
+                    .or_else(|| {
+                        reference.and_then(|reference| {
+                            reference
+                                .attributes
+                                .get("id")
+                                .map(|id| format!("unresolved id {id}"))
+                        })
+                    })
+                    .unwrap_or_else(|| "unresolved table target".to_string());
+                markdown.push_str(&format!(
+                    "| {} | {} | [{}](../objects/{}) | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+                    md(&privilege_set.source_file),
+                    md(&privilege_set.source_action),
+                    md(&privilege_set.name),
+                    component_page_relative_path(privilege_set, components),
+                    md(if accounts.is_empty() {
+                        "—"
+                    } else {
+                        accounts.as_str()
+                    }),
+                    md(&target),
+                    md(access_setting(table, "View")),
+                    md(access_setting(table, "Edit")),
+                    md(access_setting(table, "Create")),
+                    md(access_setting(table, "Delete")),
+                    md(access_setting(table, "Fields")),
+                    md(&privilege_set.source_path),
+                ));
+            }
+        }
+        markdown.push_str("\nAccount names and assigned privilege sets are included; passwords and credentials remain redacted in source object records. Settings are transcribed per exported action and are not an effective-access calculation.\n");
+    }
+    fs::write(directory.join("permission-matrix.md"), markdown)?;
+    Ok(())
+}
+
+fn source_file_identity(component: &Component) -> &str {
+    component
+        .object_id
+        .split(':')
+        .next()
+        .filter(|identity| !identity.is_empty())
+        .unwrap_or(&component.source_file)
+}
+
+fn account_uses_privilege_set(account: &Component, privilege_set: &Component) -> bool {
+    let mut references = Vec::new();
+    collect_named_nodes(
+        &account.properties,
+        "PrivilegeSetReference",
+        &mut references,
+    );
+    references.into_iter().any(|reference| {
+        if let Some(uuid) = reference.attributes.get("UUID") {
+            privilege_set.xml_uuid.as_deref() == Some(uuid.as_str())
+                && reference
+                    .attributes
+                    .get("id")
+                    .is_none_or(|id| privilege_set.xml_id.as_deref() == Some(id.as_str()))
+        } else {
+            reference
+                .attributes
+                .get("id")
+                .is_some_and(|id| privilege_set.xml_id.as_deref() == Some(id.as_str()))
+        }
+    })
+}
+
+fn accounts_for_privilege_set(privilege_set: &Component, components: &[Component]) -> String {
+    components
+        .iter()
+        .filter(|component| {
+            component.kind == "account"
+                && source_file_identity(component) == source_file_identity(privilege_set)
+                && account_uses_privilege_set(component, privilege_set)
+        })
+        .map(|component| format!("{} ({})", component.name, component.source_action))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_access_section(section: &XmlNode) -> String {
+    let settings = section
+        .attributes
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    if settings.is_empty() {
+        "No section attributes; inspect linked source for details".to_string()
+    } else {
+        settings.join(", ")
+    }
+}
+
+fn component_page_relative_path(component: &Component, components: &[Component]) -> String {
+    let index = components
+        .iter()
+        .position(|candidate| candidate.record_id == component.record_id)
+        .unwrap_or_default()
+        + 1;
+    format!(
+        "{}/{:05}-{}-{}.md",
+        component.kind,
+        index,
+        component.kind,
+        slug(&component.name)
+    )
+}
+
+fn access_setting<'a>(table: &'a XmlNode, name: &str) -> &'a str {
+    first_named_node(table, name)
+        .and_then(|node| node.attributes.get("access"))
+        .map(String::as_str)
+        .unwrap_or("not specified")
+}
+
+fn first_named_node<'a>(node: &'a XmlNode, name: &str) -> Option<&'a XmlNode> {
+    if node.name == name {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| first_named_node(child, name))
+}
+
+fn collect_named_nodes<'a>(node: &'a XmlNode, name: &str, output: &mut Vec<&'a XmlNode>) {
+    if node.name == name {
+        output.push(node);
+    }
+    for child in &node.children {
+        collect_named_nodes(child, name, output);
+    }
 }
 
 fn remove_obsolete_component_pages(
@@ -678,6 +993,7 @@ fn is_generated_page_name(name: &str) -> bool {
                 | "unresolved_script_step_group"
                 | "unresolved_custom_function_calculation"
                 | "unresolved_value_list_options"
+                | "unknown_catalog_item"
         )
         && !slug.is_empty()
         && slug
@@ -958,7 +1274,7 @@ mod tests {
         let inventory = finish_inventory(parsed, "UTF-8".to_string()).unwrap();
         let serialized = serde_json::to_string(&inventory).unwrap();
         assert_eq!(
-            inventory.application.file_name.as_deref(),
+            inventory.applications[0].file_name.as_deref(),
             Some("Example.fmp12")
         );
         assert_eq!(
@@ -988,7 +1304,7 @@ mod tests {
                 .observed_entries,
             1
         );
-        assert!(inventory.ddr_info_present);
+        assert!(inventory.applications[0].ddr_info_present);
         assert!(serialized.contains("FutureCatalog"));
         assert!(!serialized.contains("PRIVATE PERSON"));
         assert!(!serialized.contains("../Example.fmp12"));
@@ -1066,7 +1382,7 @@ mod tests {
     #[test]
     fn defaults_output_folder_to_input_filename_stem() {
         assert_eq!(
-            default_output_dir(Path::new("samples/sample-small.xml")),
+            default_output_dir(&[PathBuf::from("samples/sample-small.xml")]),
             PathBuf::from("output/sample-small")
         );
     }
