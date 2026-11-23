@@ -14,15 +14,15 @@ This review uses the smallest supplied export, `samples/sample-small.xml`, and i
 | Priority | Gap | Status and remaining work |
 |---|---|---|
 | 1 | Input breadth | Partial: multiple XML files/directories are combined with per-file metadata and catalog counts; ID-bearing objects from unknown catalogs are preserved as raw components. Add version/format fixtures and catalog-split completeness rules. |
-| 1 | Calculation dependencies | Partial: structured references plus qualified `Table::Field` and known custom-function name matches in calculation text produce explicitly heuristic edges. Table-occurrence aliases, quoted identifiers, complete formula parsing, and dynamic cases remain open. |
-| 1 | Complete script semantics | Partial: direct/dynamic calls, call reachability/cycle candidates, parameter/result marker findings, control flow, and expanded effects are reported. Expressions are not evaluated; caller/callee parameter matching, dynamic target resolution, and conditional recursion remain open. |
-| 1 | Model reference resolution | Partial: explicit references resolve locally; a unique UUID match across supplied files is retained as a heuristic candidate. Name-based calculation matches remain candidates. Complete relationship semantics and external-file validation remain open. |
-| 1 | UI behavior | Partial: workflow candidates now link entry UI objects, scripts, layouts, field reads/writes, table occurrences, and external sources. Portal behavior, user-state/navigation path validation, and complete interaction flows remain open. |
+| 1 | Calculation dependencies | Partial: structured references plus qualified `Table::Field` and known custom-function name matches in calculation text produce heuristic edges; dynamic constructs such as `Evaluate`, `GetField`, `ExecuteSQL`, and `While` are flagged. Table-occurrence aliases, quoted identifiers, full formula parsing, and context-sensitive interpretation remain open. |
+| 1 | Complete script semantics | Partial: call reachability/cycle candidates, parameter/result marker and flow candidates, control flow, and expanded effects are reported. Expressions are not evaluated; dynamic target resolution, precise caller/callee value matching, and execution-conditioned recursion remain open. |
+| 1 | Model reference resolution | Partial: explicit references resolve locally; unique UUID matches across supplied files are heuristic candidates. Relationship join edges preserve left/right table occurrences and join-predicate evidence. Cross-file source identity, sort/cascade semantics, and full relationship validation remain open. |
+| 1 | UI behavior | Partial: workflow candidates link entry objects, scripts, layouts, field reads/writes, table occurrences, and external sources. Portal behavior, per-branch paths, user-state, and complete interaction-flow grouping remain open. |
 | 2 | Authorization analysis | Partial: account assignments, general settings, table record rules, and explicit layout/script/value-list and field override rows are transcribed by source action. These are not merged effective permissions; unsupported or absent field rows cannot be inferred. |
 | 2 | Integration analysis | Partial: `integrations/overview.md` summarizes external-source records and explicit reference counts, plus script steps classified as URL, email, import, and export effects. Endpoint resolution, plug-in behavior, and runtime success remain unverified. |
-| 2 | Workflows and migration deliverables | Partial: `workflows/` contains candidates reachable from explicit UI trigger/navigation edges, with scripts, layouts, field references, effects, evidence, and limitations. Screen specifications, migration contracts, and test-scenario seeds remain future work. |
-| 2 | Coverage/diagnostic report | The overview is a catalog inventory; it does not yet provide a unified parsed/unsupported/uncertain feature audit or explain all analysis limitations. |
-| 3 | Offline HTML and graphs | The current deliverable is JSON plus per-object Markdown. Searchable offline HTML and interactive dependency/navigation graphs remain unimplemented. |
+| 2 | Workflows and migration deliverables | Partial: the bundle includes candidate workflows, screen/data/security/integration migration notes, and validation scenario seeds. These are static planning artifacts; runtime expectations and business requirements require human confirmation. |
+| 2 | Coverage/diagnostic report | Partial: `coverage.json`, `diagnostics.json`, and reports summarize observed catalogs, component/edge/finding counts, preserved XML element counts, unresolved edges, and known limitations. A version-by-version unsupported-feature inventory remains open. |
+| 3 | Offline HTML and graphs | Not started: graph JSON is generated for relationships, calls, navigation, dependencies, and workflows, but the searchable offline site, accessible graph interactions, and safe HTML rendering are not implemented. |
 
 ## DDR export comparison
 
@@ -34,8 +34,8 @@ References: [Claris: Documenting database schemas](https://help.claris.com/en/pr
 
 ## Recommended sequence
 
-1. Acquire paired exports and finish the DDR-versus-`DDR_INFO` evidence comparison; add authentic format/version fixtures.
-2. Implement calculation parsing and finish cross-catalog reference coverage.
-3. Extend script summaries and compose UI navigation from layouts, menus, triggers, and script effects.
-4. Complete authorization/integration summaries, then workflows and migration contracts.
-5. Generate a coverage audit before adding offline HTML, so every view can show provenance and unresolved evidence.
+1. Run bundle generation and `validate` over each supplied real export, then a multi-file bundle; record what is proven and which sources are unrelated.
+2. Add tests for hostile names/paths and scan every artifact for credential redaction; validate manifest and JSONL/schema contracts.
+3. Extend only the remaining evidenced calculation, script, relationship, UI, and privilege semantics; keep unsupported cases explicit.
+4. Finish the measurable coverage inventory and confirm migration/agent packages preserve evidence and uncertainty.
+5. Begin the offline HTML renderer only after those bundle gates pass; the optional paired DDR-versus-`DDR_INFO` comparison may happen separately.

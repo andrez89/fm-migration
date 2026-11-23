@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "coverage.schema.json",
+  "title": "fmblueprint coverage report",
+  "type": "object",
+  "required": ["schema_version", "catalogs", "component_counts", "edge_counts", "edge_status_counts", "finding_counts", "preserved_xml_element_counts", "limitations"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "catalogs": { "type": "object" },
+    "component_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "edge_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "edge_status_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "finding_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "preserved_xml_element_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "limitations": { "type": "array", "items": { "type": "object", "required": ["feature", "status", "description"], "properties": { "feature": { "type": "string" }, "status": { "enum": ["partial", "unsupported", "uncertain"] }, "description": { "type": "string" } }, "additionalProperties": false } }
+  },
+  "additionalProperties": false
+}

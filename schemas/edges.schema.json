@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "edges.schema.json",
+  "title": "fmblueprint edge export",
+  "type": "object",
+  "required": ["schema_version", "edges"],
+  "properties": { "schema_version": { "const": 2 }, "edges": { "type": "array", "items": { "$ref": "edge.schema.json" } } },
+  "additionalProperties": false
+}

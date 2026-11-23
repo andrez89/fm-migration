@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "context-map.schema.json",
+  "title": "fmblueprint agent context map",
+  "type": "object",
+  "required": ["schema_version", "depth_hint", "objects"],
+  "properties": { "schema_version": { "const": 1 }, "depth_hint": { "type": "integer", "minimum": 1 }, "objects": { "type": "array", "items": { "type": "object", "required": ["id", "record_id", "kind", "name", "source_file", "status", "document", "outgoing", "incoming", "source_path"], "properties": { "id": { "type": "string" }, "record_id": { "type": "string" }, "kind": { "type": "string" }, "name": { "type": "string" }, "source_file": { "type": "string" }, "status": { "type": "string" }, "document": { "type": "string" }, "outgoing": { "$ref": "#/$defs/strings" }, "incoming": { "$ref": "#/$defs/strings" }, "source_path": { "type": "string" } }, "additionalProperties": false } } },
+  "$defs": { "strings": { "type": "array", "items": { "type": "string" } } },
+  "additionalProperties": false
+}

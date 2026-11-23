@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "diagnostic.schema.json",
+  "title": "fmblueprint diagnostic record",
+  "type": "object",
+  "required": ["id", "kind", "status", "summary", "evidence", "limitations"],
+  "properties": {
+    "id": { "type": "string" },
+    "kind": { "type": "string" },
+    "status": { "enum": ["explicit", "derived", "heuristic_candidate", "unresolved"] },
+    "summary": { "type": "string" },
+    "source_object_id": { "type": ["string", "null"] },
+    "target_object_id": { "type": ["string", "null"] },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "limitations": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "context-package.schema.json",
+  "title": "fmblueprint bounded context package",
+  "type": "object",
+  "required": ["schema_version", "root_id", "root_kind", "depth", "max_objects", "truncated", "continuation_ids", "workflow", "objects", "edges"],
+  "properties": { "schema_version": { "const": 1 }, "root_id": { "type": "string" }, "root_kind": { "enum": ["object", "workflow"] }, "depth": { "type": "integer", "minimum": 0 }, "max_objects": { "type": "integer", "minimum": 1 }, "truncated": { "type": "boolean" }, "continuation_ids": { "type": "array", "items": { "type": "string" } }, "workflow": { "type": ["object", "null"] }, "objects": { "type": "array", "items": { "type": "object" } }, "edges": { "type": "array", "items": { "$ref": "edge.schema.json" } } },
+  "additionalProperties": false
+}

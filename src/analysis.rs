@@ -127,6 +127,42 @@ pub fn analyze_scripts(components: &mut [Component]) -> Vec<AnalysisEdge> {
     edges
 }
 
+pub fn analyze_calculation_features(components: &mut [Component]) {
+    for component in components {
+        let mut calculations = Vec::new();
+        collect_calculation_texts(&component.properties, &mut calculations);
+        for record in &component.attached_records {
+            collect_calculation_texts(&record.properties, &mut calculations);
+        }
+        let mut seen = BTreeSet::new();
+        for text in calculations {
+            for function in [
+                "Evaluate",
+                "GetField",
+                "GetFieldName",
+                "ExecuteSQL",
+                "While",
+            ] {
+                if contains_function_call(&text, function) && seen.insert(function) {
+                    component.findings.push(AnalysisFinding {
+                        kind: "calculation_analysis_limit".to_string(),
+                        status: "heuristic_candidate".to_string(),
+                        summary: format!("Calculation uses {function}; its dynamic or nested semantics were not analyzed"),
+                        evidence: vec![format!("{}/Calculation/Text", component.source_path)],
+                        limitations: vec!["The function may be statically resolvable in context, but this analyzer does not parse or evaluate its arguments.".to_string()],
+                    });
+                }
+            }
+        }
+        component.findings.sort_by(|left, right| {
+            left.evidence
+                .cmp(&right.evidence)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.summary.cmp(&right.summary))
+        });
+    }
+}
+
 fn append_script_dataflow_candidates(components: &[Component], edges: &mut Vec<AnalysisEdge>) {
     let calls: Vec<_> = edges
         .iter()
@@ -404,8 +440,108 @@ pub fn analyze_component_references(components: &[Component]) -> Vec<AnalysisEdg
                 &mut edges,
             );
         }
+        if component.kind == "relationship" {
+            append_relationship_edges(component, &symbols, &mut edges);
+        }
     }
     edges
+}
+
+fn append_relationship_edges(
+    relationship: &Component,
+    symbols: &Symbols,
+    edges: &mut Vec<AnalysisEdge>,
+) {
+    let mut predicates = Vec::new();
+    collect_named_nodes(&relationship.properties, "JoinPredicate", &mut predicates);
+    for (index, predicate) in predicates.into_iter().enumerate() {
+        let left_field = first_node(predicate, "FieldReference");
+        let right_field = predicate
+            .children
+            .iter()
+            .find(|node| node.name == "RightField")
+            .and_then(|node| first_node(node, "FieldReference"));
+        let left_occurrence = left_field
+            .and_then(|field| first_node(field, "TableOccurrenceReference"))
+            .or_else(|| {
+                relationship
+                    .properties
+                    .children
+                    .iter()
+                    .find(|node| node.name == "LeftTable")
+                    .and_then(|node| first_node(node, "TableOccurrenceReference"))
+            });
+        let right_occurrence = right_field
+            .and_then(|field| first_node(field, "TableOccurrenceReference"))
+            .or_else(|| {
+                relationship
+                    .properties
+                    .children
+                    .iter()
+                    .find(|node| node.name == "RightTable")
+                    .and_then(|node| first_node(node, "TableOccurrenceReference"))
+            });
+        let left = left_occurrence.and_then(|reference| {
+            resolve_reference(
+                symbols,
+                "table_occurrence",
+                source_identity(relationship),
+                reference,
+            )
+        });
+        let right = right_occurrence.and_then(|reference| {
+            resolve_reference(
+                symbols,
+                "table_occurrence",
+                source_identity(relationship),
+                reference,
+            )
+        });
+        let Some(left) = left else {
+            continue;
+        };
+        let operator = predicate
+            .attributes
+            .get("type")
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        let left_name = left_field
+            .and_then(|field| field.attributes.get("name"))
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        let right_name = right_field
+            .and_then(|field| field.attributes.get("name"))
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        edges.push(AnalysisEdge {
+            kind: "joins_to".to_string(),
+            status: if right.is_some() { "explicit" } else { "unresolved" }.to_string(),
+            from_object_id: Some(left.object_id.clone()),
+            to_object_id: right.as_ref().map(|symbol| symbol.object_id.clone()),
+            from_record_id: Some(relationship.record_id.clone()),
+            to_record_id: right.as_ref().map(|symbol| symbol.record_id.clone()),
+            evidence: vec![format!("{}/JoinPredicate[{index}] {left_name} {operator} {right_name}", relationship.source_path)],
+            limitations: if right.is_some() { Vec::new() } else { vec!["The right table occurrence could not be uniquely resolved in this source file.".to_string()] },
+        });
+    }
+}
+
+fn collect_named_nodes<'a>(node: &'a XmlNode, name: &str, output: &mut Vec<&'a XmlNode>) {
+    if node.name == name {
+        output.push(node);
+    }
+    for child in &node.children {
+        collect_named_nodes(child, name, output);
+    }
+}
+
+fn first_node<'a>(node: &'a XmlNode, name: &str) -> Option<&'a XmlNode> {
+    if node.name == name {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| first_node(child, name))
 }
 
 pub fn discover_workflows(
@@ -413,11 +549,17 @@ pub fn discover_workflows(
     edges: &[AnalysisEdge],
 ) -> Vec<WorkflowCandidate> {
     let mut objects = BTreeMap::new();
+    let mut outgoing_edges: BTreeMap<&str, Vec<&AnalysisEdge>> = BTreeMap::new();
     for component in components {
         if component.source_action == "AddAction"
             || !objects.contains_key(component.object_id.as_str())
         {
             objects.insert(component.object_id.as_str(), component);
+        }
+    }
+    for edge in edges {
+        if let Some(source_id) = edge.from_object_id.as_deref() {
+            outgoing_edges.entry(source_id).or_default().push(edge);
         }
     }
     let mut workflows = Vec::new();
@@ -463,10 +605,10 @@ pub fn discover_workflows(
         }
 
         let mut pending_scripts = VecDeque::new();
-        if entry_edge.kind != "navigates_to" {
-            if let Some(script_id) = entry_edge.to_object_id.as_deref() {
-                pending_scripts.push_back(script_id.to_string());
-            }
+        if entry_edge.kind != "navigates_to"
+            && let Some(script_id) = entry_edge.to_object_id.as_deref()
+        {
+            pending_scripts.push_back(script_id.to_string());
         }
         if entry_edge.kind == "navigates_to"
             && let Some(layout_id) = entry_edge.to_object_id.as_deref()
@@ -487,9 +629,9 @@ pub fn discover_workflows(
                     effects.insert(finding.summary.clone());
                 }
             }
-            for edge in edges.iter().filter(|edge| {
-                edge.from_object_id.as_deref() == Some(script_id.as_str())
-                    && matches!(
+            if let Some(script_edges) = outgoing_edges.get(script_id.as_str()) {
+                for edge in script_edges.iter().copied().filter(|edge| {
+                    matches!(
                         edge.kind.as_str(),
                         "calls_script"
                             | "navigates_to"
@@ -498,40 +640,41 @@ pub fn discover_workflows(
                             | "uses_table_occurrence"
                             | "accesses_external_source"
                     )
-            }) {
-                evidence.extend(edge.evidence.iter().cloned());
-                if edge.status == "unresolved" {
-                    unresolved = true;
-                    limitations.insert(format!(
-                        "Unresolved {} reference remains in reachable script {}.",
-                        edge.kind, script_id
-                    ));
-                }
-                heuristic |= edge.status == "heuristic_candidate";
-                if edge.kind == "calls_script"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    pending_scripts.push_back(target.to_string());
-                } else if edge.kind == "navigates_to"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    layouts.insert(target.to_string());
-                } else if edge.kind == "reads_field"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    field_reads.insert(target.to_string());
-                } else if edge.kind == "writes_field"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    field_writes.insert(target.to_string());
-                } else if edge.kind == "uses_table_occurrence"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    table_occurrences.insert(target.to_string());
-                } else if edge.kind == "accesses_external_source"
-                    && let Some(target) = edge.to_object_id.as_deref()
-                {
-                    external_sources.insert(target.to_string());
+                }) {
+                    evidence.extend(edge.evidence.iter().cloned());
+                    if edge.status == "unresolved" {
+                        unresolved = true;
+                        limitations.insert(format!(
+                            "Unresolved {} reference remains in reachable script {}.",
+                            edge.kind, script_id
+                        ));
+                    }
+                    heuristic |= edge.status == "heuristic_candidate";
+                    if edge.kind == "calls_script"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        pending_scripts.push_back(target.to_string());
+                    } else if edge.kind == "navigates_to"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        layouts.insert(target.to_string());
+                    } else if edge.kind == "reads_field"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        field_reads.insert(target.to_string());
+                    } else if edge.kind == "writes_field"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        field_writes.insert(target.to_string());
+                    } else if edge.kind == "uses_table_occurrence"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        table_occurrences.insert(target.to_string());
+                    } else if edge.kind == "accesses_external_source"
+                        && let Some(target) = edge.to_object_id.as_deref()
+                    {
+                        external_sources.insert(target.to_string());
+                    }
                 }
             }
         }
@@ -647,51 +790,57 @@ fn append_textual_calculation_edges(
     let mut calculations = Vec::new();
     collect_calculation_texts(root, &mut calculations);
     for text in calculations {
-        for ((identity, qualified_name), targets) in &symbols.qualified_fields {
-            if identity != source_identity(component) || !contains_identifier(&text, qualified_name)
-            {
-                continue;
+        let text = text.to_lowercase();
+        if text.contains("::") {
+            for ((identity, qualified_name), targets) in &symbols.qualified_fields {
+                if identity != source_identity(component)
+                    || !contains_identifier_folded(&text, qualified_name)
+                {
+                    continue;
+                }
+                let target = match targets.as_slice() {
+                    [target] => Some(target),
+                    _ => None,
+                };
+                edges.push(AnalysisEdge {
+                    kind: "reads_field".to_string(),
+                    status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
+                    from_object_id: Some(component.object_id.clone()),
+                    to_object_id: target.map(|target| target.object_id.clone()),
+                    from_record_id: Some(source_record_id.to_string()),
+                    to_record_id: target.map(|target| target.record_id.clone()),
+                    evidence: vec![format!("{source_path}/Calculation/Text (name match: {qualified_name})")],
+                    limitations: vec!["This is a qualified-name match in calculation text; it may not resolve table-occurrence aliases or quoted identifiers. Prefer structured FieldReference chunks when available.".to_string()],
+                });
             }
-            let target = match targets.as_slice() {
-                [target] => Some(target),
-                _ => None,
-            };
-            edges.push(AnalysisEdge {
-                kind: "reads_field".to_string(),
-                status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
-                from_object_id: Some(component.object_id.clone()),
-                to_object_id: target.map(|target| target.object_id.clone()),
-                from_record_id: Some(source_record_id.to_string()),
-                to_record_id: target.map(|target| target.record_id.clone()),
-                evidence: vec![format!("{source_path}/Calculation/Text (name match: {qualified_name})")],
-                limitations: vec!["This is a qualified-name match in calculation text; it may not resolve table-occurrence aliases or quoted identifiers. Prefer structured FieldReference chunks when available.".to_string()],
-            });
         }
-        for ((identity, name), targets) in &symbols.custom_functions_by_name {
-            if identity != source_identity(component) || !contains_function_call(&text, name) {
-                continue;
+        if text.contains('(') {
+            for ((identity, name), targets) in &symbols.custom_functions_by_name {
+                if identity != source_identity(component)
+                    || !contains_function_call_folded(&text, name)
+                {
+                    continue;
+                }
+                let target = match targets.as_slice() {
+                    [target] => Some(target),
+                    _ => None,
+                };
+                edges.push(AnalysisEdge {
+                    kind: "uses_custom_function".to_string(),
+                    status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
+                    from_object_id: Some(component.object_id.clone()),
+                    to_object_id: target.map(|target| target.object_id.clone()),
+                    from_record_id: Some(source_record_id.to_string()),
+                    to_record_id: target.map(|target| target.record_id.clone()),
+                    evidence: vec![format!("{source_path}/Calculation/Text (name match: {name})")],
+                    limitations: vec!["This is a function-name match in calculation text; nested syntax and quoted function names are not parsed.".to_string()],
+                });
             }
-            let target = match targets.as_slice() {
-                [target] => Some(target),
-                _ => None,
-            };
-            edges.push(AnalysisEdge {
-                kind: "uses_custom_function".to_string(),
-                status: if target.is_some() { "heuristic_candidate" } else { "unresolved" }.to_string(),
-                from_object_id: Some(component.object_id.clone()),
-                to_object_id: target.map(|target| target.object_id.clone()),
-                from_record_id: Some(source_record_id.to_string()),
-                to_record_id: target.map(|target| target.record_id.clone()),
-                evidence: vec![format!("{source_path}/Calculation/Text (name match: {name})")],
-                limitations: vec!["This is a function-name match in calculation text; nested syntax and quoted function names are not parsed.".to_string()],
-            });
         }
     }
 }
 
-fn contains_identifier(text: &str, needle: &str) -> bool {
-    let text = text.to_lowercase();
-    let needle = needle.to_lowercase();
+fn contains_identifier_folded(text: &str, needle: &str) -> bool {
     text.match_indices(&needle).any(|(start, _)| {
         let end = start + needle.len();
         let identifier = |byte: Option<u8>| {
@@ -707,6 +856,10 @@ fn contains_identifier(text: &str, needle: &str) -> bool {
 
 fn contains_function_call(text: &str, name: &str) -> bool {
     let text = text.to_lowercase();
+    contains_function_call_folded(&text, name)
+}
+
+fn contains_function_call_folded(text: &str, name: &str) -> bool {
     let name = name.to_lowercase();
     text.match_indices(&name).any(|(start, _)| {
         let end = start + name.len();
@@ -1512,5 +1665,136 @@ mod tests {
                 .iter()
                 .any(|finding| finding.kind == "unreachable_step_candidate")
         );
+    }
+
+    #[test]
+    fn captures_script_parameter_result_and_call_flow_candidates() {
+        let xml = br#"<FMSaveAsXML File="Flow.fmp12" UUID="flow-file"><Structure><AddAction>
+          <ScriptCatalog><Script id="1" name="Caller"><UUID>caller</UUID></Script><Script id="2" name="Callee"><UUID>callee</UUID></Script></ScriptCatalog>
+          <StepsForScripts>
+            <Script><ScriptReference id="1" name="Caller" UUID="caller"/><ObjectList>
+              <Step id="1" index="0" name="Perform Script" enable="True"><Options>0</Options><ParameterValues><Parameter><ScriptReference id="2" name="Callee" UUID="callee"/><Calculation><Text>42</Text></Calculation></Parameter></ParameterValues></Step>
+              <Step id="141" index="1" name="Set Variable" enable="True"><Options>0</Options><ParameterValues><Parameter><Name value="$result"/><Calculation><Text>Get ( ScriptResult )</Text></Calculation></Parameter></ParameterValues></Step>
+            </ObjectList></Script>
+            <Script><ScriptReference id="2" name="Callee" UUID="callee"/><ObjectList>
+              <Step id="141" index="0" name="Set Variable" enable="True"><Options>0</Options><ParameterValues><Parameter><Name value="$input"/><Calculation><Text>Get ( ScriptParameter )</Text></Calculation></Parameter></ParameterValues></Step>
+              <Step id="103" index="1" name="Exit Script" enable="True"><Options>0</Options><ParameterValues><Parameter><Calculation><Text>$input</Text></Calculation></Parameter></ParameterValues></Step>
+            </ObjectList></Script>
+          </StepsForScripts>
+        </AddAction></Structure></FMSaveAsXML>"#;
+        let mut components = extract_data_model(Cursor::new(xml)).unwrap();
+        let edges = analyze_scripts(&mut components);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.kind == "passes_script_parameter_to"
+                    && edge.status == "heuristic_candidate")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.kind == "may_receive_script_result_from"
+                    && edge.status == "heuristic_candidate")
+        );
+        let callee = components
+            .iter()
+            .find(|component| component.name == "Callee")
+            .unwrap();
+        assert!(
+            callee
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "script_parameter_read")
+        );
+        assert!(
+            callee
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "script_result_return")
+        );
+    }
+
+    #[test]
+    fn resolves_relationship_join_edges_between_distinct_occurrences() {
+        let xml = br#"<FMSaveAsXML File="Join.fmp12" UUID="join-file"><Structure><AddAction>
+          <BaseTableCatalog><BaseTable id="1" name="A"><UUID>table-a</UUID></BaseTable><BaseTable id="2" name="B"><UUID>table-b</UUID></BaseTable></BaseTableCatalog>
+          <TableOccurrenceCatalog><TableOccurrence id="10" name="A"><UUID>to-a</UUID><BaseTableReference id="1" name="A" UUID="table-a"/></TableOccurrence><TableOccurrence id="11" name="B"><UUID>to-b</UUID><BaseTableReference id="2" name="B" UUID="table-b"/></TableOccurrence></TableOccurrenceCatalog>
+          <RelationshipCatalog><Relationship id="3" name="A_to_B"><UUID>rel</UUID><LeftTable><TableOccurrenceReference id="10" name="A" UUID="to-a"/></LeftTable><RightTable><TableOccurrenceReference id="11" name="B" UUID="to-b"/></RightTable><JoinPredicateList><JoinPredicate type="Equal"><LeftField><FieldReference id="1" name="id" UUID="field-a"><TableOccurrenceReference id="10" name="A" UUID="to-a"/></FieldReference></LeftField><RightField><FieldReference id="2" name="a_id" UUID="field-b"><TableOccurrenceReference id="11" name="B" UUID="to-b"/></FieldReference></RightField></JoinPredicate></JoinPredicateList></Relationship></RelationshipCatalog>
+        </AddAction></Structure></FMSaveAsXML>"#;
+        let components = extract_data_model(Cursor::new(xml)).unwrap();
+        let edges = analyze_component_references(&components);
+        let left = components
+            .iter()
+            .find(|component| component.kind == "table_occurrence" && component.name == "A")
+            .unwrap();
+        let right = components
+            .iter()
+            .find(|component| component.kind == "table_occurrence" && component.name == "B")
+            .unwrap();
+        assert!(edges.iter().any(|edge| edge.kind == "joins_to"
+            && edge.status == "explicit"
+            && edge.from_object_id.as_deref() == Some(left.object_id.as_str())
+            && edge.to_object_id.as_deref() == Some(right.object_id.as_str())
+            && edge.evidence.iter().any(|source| source.contains("Equal"))));
+    }
+
+    #[test]
+    fn extracts_qualified_calculation_dependencies_as_heuristic_edges() {
+        let xml = br#"<FMSaveAsXML File="Calc.fmp12" UUID="calc-file"><Structure><AddAction>
+          <BaseTableCatalog><BaseTable id="1" name="T"><UUID>table</UUID></BaseTable></BaseTableCatalog>
+          <FieldCatalog><BaseTableReference id="1" name="T" UUID="table"/><Field id="1" name="Value"><UUID>value</UUID></Field><Field id="2" name="Computed"><UUID>computed</UUID><Calculation><Text>T::Value + Normalize(1) + GetField($fieldName)</Text></Calculation></Field></FieldCatalog>
+          <CustomFunctionsCatalog><CustomFunction id="1" name="Normalize"><UUID>normalize</UUID></CustomFunction></CustomFunctionsCatalog>
+        </AddAction></Structure></FMSaveAsXML>"#;
+        let mut components = extract_data_model(Cursor::new(xml)).unwrap();
+        analyze_calculation_features(&mut components);
+        let computed = components
+            .iter()
+            .find(|component| component.name == "Computed")
+            .unwrap();
+        let value = components
+            .iter()
+            .find(|component| component.name == "Value")
+            .unwrap();
+        let normalize = components
+            .iter()
+            .find(|component| component.kind == "custom_function")
+            .unwrap();
+        let edges = analyze_component_references(&components);
+        assert!(edges.iter().any(|edge| edge.kind == "reads_field"
+            && edge.status == "heuristic_candidate"
+            && edge.from_object_id.as_deref() == Some(computed.object_id.as_str())
+            && edge.to_object_id.as_deref() == Some(value.object_id.as_str())));
+        assert!(edges.iter().any(|edge| edge.kind == "uses_custom_function"
+            && edge.status == "heuristic_candidate"
+            && edge.from_object_id.as_deref() == Some(computed.object_id.as_str())
+            && edge.to_object_id.as_deref() == Some(normalize.object_id.as_str())));
+        assert!(
+            computed
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "calculation_analysis_limit"
+                    && finding.summary.contains("GetField"))
+        );
+    }
+
+    #[test]
+    fn resolves_unique_cross_file_uuid_as_heuristic_candidate_even_if_numeric_ids_differ() {
+        let target = br#"<FMSaveAsXML File="Target.fmp12" UUID="target-file"><Structure><AddAction><BaseTableCatalog><BaseTable id="1" name="T"><UUID>table</UUID></BaseTable></BaseTableCatalog><FieldCatalog><BaseTableReference id="1" name="T" UUID="table"/><Field id="1" name="Value"><UUID>global-field</UUID></Field></FieldCatalog></AddAction></Structure></FMSaveAsXML>"#;
+        let source = br#"<FMSaveAsXML File="Source.fmp12" UUID="source-file"><Structure><AddAction><BaseTableCatalog><BaseTable id="1" name="S"><UUID>source-table</UUID></BaseTable></BaseTableCatalog><FieldCatalog><BaseTableReference id="1" name="S" UUID="source-table"/><Field id="2" name="Copy"><UUID>copy-field</UUID><Calculation><FieldReference id="999" name="Value" UUID="global-field"/></Calculation></Field></FieldCatalog></AddAction></Structure></FMSaveAsXML>"#;
+        let mut components = extract_data_model(Cursor::new(target)).unwrap();
+        components.extend(extract_data_model(Cursor::new(source)).unwrap());
+        let source_field = components
+            .iter()
+            .find(|component| component.name == "Copy")
+            .unwrap();
+        let target_field = components
+            .iter()
+            .find(|component| component.name == "Value")
+            .unwrap();
+        let edges = analyze_component_references(&components);
+        assert!(edges.iter().any(|edge| edge.kind == "references_field"
+            && edge.status == "heuristic_candidate"
+            && edge.from_object_id.as_deref() == Some(source_field.object_id.as_str())
+            && edge.to_object_id.as_deref() == Some(target_field.object_id.as_str())));
     }
 }

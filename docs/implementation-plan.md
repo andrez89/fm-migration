@@ -31,15 +31,10 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 
 ## In progress and future
 
-- First three coverage slices (initial implementation complete; broader fixture validation remains):
-  1. Input: `analyze` accepts multiple XML paths or a directory of XML files, combines inventories and components, reports catalog counts per source file, and retains ID-bearing entries from unknown catalogs as raw objects. Format/version fixtures and split-export completeness rules remain open.
-  2. References: explicit reference elements and structured field/custom-function calculation chunks in component properties, attached calculation records, and script steps resolve to same-file objects where identity is unambiguous; unresolved targets remain explicit. Calculation text parsing, cross-file references, and complete relationship semantics remain open.
-  3. UI/security: button/menu/layout-trigger script references and account privilege-set references produce typed edges; `security/permission-matrix.md` includes table rules and explicit layout/script/value-list/field rows by source action. Effective permissions and full UI validation remain open.
-- Calculation text now produces candidate field/custom-function dependencies from qualified names; unique UUID matches across supplied files are marked heuristic. Formula syntax and FileMaker source identity still need validation.
-- Workflow candidates now link UI entries and resolved scripts, layouts, field reads/writes, table occurrences, and external sources. Script summaries include resolved call reachability, recursion candidates, and parameter/result markers.
-- Next: validate these expanded analyses against additional authentic exports, then finish expression-level dataflow, complete workflow navigation, and effective-access semantics where export completeness permits.
-- Integration/workflow slice: initial summaries now report external data sources, classified URL/email/import/export effects, and reachability-based workflow candidates in `integrations/` and `workflows/`. These are static evidence summaries, not validated endpoints or executed business processes.
-- Later: complete calculation/custom-function dependency parsing; full effective privilege analysis; migration contracts; versioned schemas; bounded agent context packages; and offline HTML documentation.
+- Analysis prerequisites implemented: multiple-input inventory, typed references, relationship join edges, script parameter/result candidates and call summaries, heuristic calculation references, workflow links, and source-action security rows. Broader authentic fixture validation remains required.
+- The generated pre-HTML bundle now includes versioned JSON/JSONL artifacts and schemas, coverage/diagnostics, graph datasets, framework-neutral migration documents, agent context/unknown/task/test-seed files, plus `validate` and bounded `context` commands. `validate` checks manifest paths, JSON syntax, local Markdown links, and graph references; complete JSON Schema validation remains a follow-up.
+- Remaining before HTML: validate the full bundle against all supplied real exports; tighten multi-file source identity and calculation/TO semantics from real evidence; test hostile Markdown/path strings and secret redaction across all artifacts; add schema/link contract checks; report unsupported catalogs and feature families exhaustively enough to drive UI filters. Do not present effective authorization or runtime workflows as proven.
+- After those gates: implement the offline HTML reader for the manifest, component JSONL, graph files, workflow candidates, and diagnostics. DDR comparison remains optional and is not a blocker for HTML; keep it as a separate adapter if later justified.
 - DDR support remains an optional decision after paired-export comparison; it must use a separate input adapter.
 - Preserve unsupported or ambiguous source constructs as diagnostics; do not infer a final application state from partial action records.
 - Sample-specific evidence and ranked gaps are tracked in [sample-analysis-gaps.md](sample-analysis-gaps.md). The current sample has no `DDR_INFO`; compare paired exports before deciding whether a separate DDR adapter adds required coverage.
@@ -49,6 +44,7 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 - `cargo fmt --check`
 - `cargo test`
 - `cargo clippy --all-targets -- -D warnings`
+- `cargo run -- validate <bundle>` validates generated manifest paths, JSON/JSONL syntax, Markdown links, and edge endpoints.
 - Local sample check: schema version, action provenance, attached-detail counts, credential redaction, deterministic output, and Markdown links.
 
 ## Constraints

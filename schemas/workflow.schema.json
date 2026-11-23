@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "workflow.schema.json",
+  "title": "fmblueprint workflow candidate",
+  "type": "object",
+  "required": ["id", "status", "source_file", "entry_object_id", "entry_name", "entry_kind", "script_ids", "layout_ids", "field_read_ids", "field_write_ids", "table_occurrence_ids", "external_source_ids", "effects", "evidence", "limitations"],
+  "properties": {
+    "id": { "type": "string" }, "status": { "enum": ["structurally_derived", "heuristic_candidate", "partially_unresolved"] }, "source_file": { "type": "string" }, "entry_object_id": { "type": "string" }, "entry_name": { "type": "string" }, "entry_kind": { "type": "string" },
+    "script_ids": { "$ref": "#/$defs/strings" }, "layout_ids": { "$ref": "#/$defs/strings" }, "field_read_ids": { "$ref": "#/$defs/strings" }, "field_write_ids": { "$ref": "#/$defs/strings" }, "table_occurrence_ids": { "$ref": "#/$defs/strings" }, "external_source_ids": { "$ref": "#/$defs/strings" }, "effects": { "$ref": "#/$defs/strings" }, "evidence": { "$ref": "#/$defs/strings" }, "limitations": { "$ref": "#/$defs/strings" }
+  },
+  "$defs": { "strings": { "type": "array", "items": { "type": "string" } } },
+  "additionalProperties": false
+}

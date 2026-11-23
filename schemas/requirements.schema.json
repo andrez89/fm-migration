@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "requirements.schema.json",
+  "title": "fmblueprint static finding record",
+  "type": "object",
+  "required": ["id", "kind", "statement", "status", "source_objects", "evidence", "dependencies", "unknowns"],
+  "properties": { "id": { "type": "string" }, "kind": { "const": "static_finding" }, "statement": { "type": "string" }, "status": { "enum": ["explicit", "derived", "heuristic_candidate", "unresolved"] }, "source_objects": { "$ref": "#/$defs/strings" }, "evidence": { "$ref": "#/$defs/strings" }, "dependencies": { "$ref": "#/$defs/strings" }, "unknowns": { "$ref": "#/$defs/strings" } },
+  "$defs": { "strings": { "type": "array", "items": { "type": "string" } } },
+  "additionalProperties": false
+}

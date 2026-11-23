@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "diagnostics.schema.json",
+  "title": "fmblueprint diagnostics report",
+  "type": "object",
+  "required": ["schema_version", "diagnostics"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "diagnostics": { "type": "array", "items": { "$ref": "diagnostic.schema.json" } }
+  },
+  "additionalProperties": false
+}

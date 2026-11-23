@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "testing-scenario.schema.json",
+  "title": "fmblueprint workflow test seed",
+  "type": "object",
+  "required": ["id", "kind", "status", "entry_object_id", "actions", "observed_static_effects", "open_questions", "evidence"],
+  "properties": { "id": { "type": "string" }, "kind": { "const": "workflow_validation_seed" }, "status": { "enum": ["structurally_derived", "heuristic_candidate", "partially_unresolved"] }, "entry_object_id": { "type": "string" }, "actions": { "type": "array", "items": { "type": "string" } }, "observed_static_effects": { "type": "array", "items": { "type": "string" } }, "open_questions": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } },
+  "additionalProperties": false
+}

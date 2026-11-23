@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "object.schema.json",
+  "title": "fmblueprint component record",
+  "type": "object",
+  "required": ["record_id", "object_id", "kind", "name", "source_file", "source_action", "source_path", "properties", "attached_records", "findings", "diagnostics"],
+  "properties": {
+    "record_id": { "type": "string", "minLength": 1 }, "object_id": { "type": "string", "minLength": 1 }, "kind": { "type": "string" }, "name": { "type": "string" }, "source_file": { "type": "string" }, "source_action": { "type": "string" }, "source_path": { "type": "string" },
+    "xml_id": { "type": ["string", "null"] }, "xml_uuid": { "type": ["string", "null"] }, "table_id": { "type": ["string", "null"] }, "table_name": { "type": ["string", "null"] }, "parent_object_id": { "type": ["string", "null"] }, "parent_record_id": { "type": ["string", "null"] },
+    "properties": { "$ref": "#/$defs/xmlNode" }, "attached_records": { "type": "array", "items": { "type": "object" } }, "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } }, "diagnostics": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "xmlNode": { "type": "object", "required": ["name", "attributes", "text", "children"], "properties": { "name": { "type": "string" }, "attributes": { "type": "object", "additionalProperties": { "type": "string" } }, "text": { "type": "string" }, "children": { "type": "array", "items": { "$ref": "#/$defs/xmlNode" } } }, "additionalProperties": false },
+    "finding": { "type": "object", "required": ["kind", "status", "summary", "evidence", "limitations"], "properties": { "kind": { "type": "string" }, "status": { "enum": ["explicit", "derived", "heuristic_candidate", "unresolved"] }, "summary": { "type": "string" }, "evidence": { "type": "array", "items": { "type": "string" } }, "limitations": { "type": "array", "items": { "type": "string" } } }, "additionalProperties": false }
+  },
+  "additionalProperties": false
+}

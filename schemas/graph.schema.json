@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "graph.schema.json",
+  "title": "fmblueprint graph export",
+  "type": "object",
+  "required": ["schema_version", "edges"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "edges": { "type": "array", "items": { "$ref": "edge.schema.json" } }
+  },
+  "additionalProperties": false
+}

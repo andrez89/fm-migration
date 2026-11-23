@@ -2,10 +2,10 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs` contains the `fmblueprint` CLI and output orchestration; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative script findings and typed edges. Keep tests focused in those modules.
-- `docs/filemaker_rust_migration_tool_prompt.md` is the product requirements source. `docs/implementation-plan.md` tracks completed and future work; keep it current when phase status changes.
+- `src/main.rs` contains the `fmblueprint` CLI and bundle/report generation; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative findings, typed edges, and workflow candidates. Unit tests live beside these modules.
+- `schemas/` defines the versioned JSON/JSONL contracts. `docs/filemaker_rust_migration_tool_prompt.md` is the product requirements source; keep `docs/implementation-plan.md`, `docs/sample-analysis-gaps.md`, `docs/format-support.md`, `docs/architecture.md`, `docs/decisions.md`, and `CHANGELOG.md` current.
 - `samples/` contains real FileMaker XML exports for local analysis. Treat these as potentially sensitive and do not add new exports or generated output to Git without explicit approval.
-- The CLI accepts XML files or a directory of XML files, writes a combined inventory and schema-v2 `objects.json`/`edges.json`, and creates `security/permission-matrix.md`. A single file defaults to `output/<input-stem>`; `--out` overrides the destination. Component pages are grouped under `objects/<kind>/`; the root `output/` directory is Git-ignored.
+- The CLI accepts XML files or directories and emits a versioned bundle with coverage, diagnostics, graphs, migration notes, and agent artifacts. A single file defaults to `output/<input-stem>`; `--out` overrides the destination. Component pages are grouped under `objects/<kind>/`; generated output stays outside Git.
 
 ## Build, Test, and Development Commands
 
@@ -14,10 +14,12 @@
 - `cargo fmt --check` verifies formatting. Run `cargo fmt` to apply formatting.
 - `cargo clippy --all-targets -- -D warnings` checks all targets and treats warnings as errors.
 - `cargo run -- analyze samples/sample-small.xml` analyzes the smallest supplied sample and writes to `output/sample-small/`. Pass multiple files or a directory to combine exports. Use `--out /tmp/fmblueprint-output` to choose another location.
+- `cargo run -- validate output/sample-small` checks bundle files, JSON/JSONL syntax, local Markdown links, and edge targets.
+- `cargo run -- context output/sample-small --id '<object-or-workflow-id>' --depth 2` writes a bounded JSON context package to stdout.
 
 ## Coding Style & Naming Conventions
 
-Use standard Rust formatting (4-space indentation). Name modules, functions, and local values with `snake_case`; types and enums with `PascalCase`; constants with `SCREAMING_SNAKE_CASE`. Keep XML parsing streaming and deterministic. Include account names and privilege-set roles, but redact passwords and credentials. Preserve ID-bearing objects from unknown catalogs as raw components and report their catalog names; do not guess semantics. The tool must work offline and must not use AI at runtime.
+Use standard Rust formatting (4-space indentation). Name modules, functions, and local values with `snake_case`; types and enums with `PascalCase`; constants with `SCREAMING_SNAKE_CASE`. Keep XML parsing streaming and deterministic. Include account names and privilege-set roles, but redact passwords and credentials. Preserve unknown catalog items as raw components and report their catalog names; do not guess semantics. The tool must work offline and must not use AI at runtime.
 
 ## Testing Guidelines
 

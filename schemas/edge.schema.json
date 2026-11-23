@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "edge.schema.json",
+  "title": "fmblueprint analysis edge",
+  "type": "object",
+  "required": ["kind", "status", "from_object_id", "to_object_id", "from_record_id", "to_record_id", "evidence", "limitations"],
+  "properties": {
+    "kind": { "type": "string" },
+    "status": { "enum": ["explicit", "derived", "heuristic_candidate", "unresolved"] },
+    "from_object_id": { "type": ["string", "null"] },
+    "to_object_id": { "type": ["string", "null"] },
+    "from_record_id": { "type": ["string", "null"] },
+    "to_record_id": { "type": ["string", "null"] },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "limitations": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

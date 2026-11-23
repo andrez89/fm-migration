@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "application.schema.json",
+  "title": "fmblueprint application inventory",
+  "type": "object",
+  "required": ["schema_version", "source_format", "applications", "catalogs", "known_catalogs_not_observed", "diagnostics"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "source_format": { "const": "FMSaveAsXML" },
+    "applications": { "type": "array", "items": { "type": "object", "required": ["input_encoding", "ddr_info_present"], "properties": { "file_name": { "type": ["string", "null"] }, "uuid": { "type": ["string", "null"] }, "export_version": { "type": ["string", "null"] }, "filemaker_version": { "type": ["string", "null"] }, "locale": { "type": ["string", "null"] }, "input_encoding": { "type": "string" }, "ddr_info_present": { "type": "boolean" } }, "additionalProperties": false } },
+    "catalogs": { "type": "array", "items": { "type": "object", "required": ["source_file", "action", "name", "occurrences", "observed_entries"], "properties": { "source_file": { "type": "string" }, "action": { "type": "string" }, "name": { "type": "string" }, "occurrences": { "type": "integer", "minimum": 0 }, "declared_member_count": { "type": ["integer", "null"], "minimum": 0 }, "observed_entries": { "type": "integer", "minimum": 0 } }, "additionalProperties": false } },
+    "known_catalogs_not_observed": { "type": "array", "items": { "type": "string" } },
+    "diagnostics": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

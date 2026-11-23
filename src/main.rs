@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
-    io::{self, BufReader, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -10,8 +10,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 mod analysis;
 mod components;
 use analysis::{
-    AnalysisEdge, WorkflowCandidate, analyze_component_references, analyze_scripts,
-    discover_workflows,
+    AnalysisEdge, WorkflowCandidate, analyze_calculation_features, analyze_component_references,
+    analyze_scripts, discover_workflows,
 };
 use components::{Component, XmlNode, extract_data_model};
 use quick_xml::{Reader, XmlVersion, encoding::DecodingReader, events::Event};
@@ -54,6 +54,20 @@ enum Commands {
         input: Vec<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    Validate {
+        #[arg(value_name = "BUNDLE")]
+        bundle: PathBuf,
+    },
+    Context {
+        #[arg(value_name = "BUNDLE")]
+        bundle: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, default_value_t = 250)]
+        max_objects: usize,
     },
 }
 
@@ -128,10 +142,109 @@ struct ComponentPageManifest {
     pages: Vec<String>,
 }
 
+type GraphSelector = (&'static str, fn(&AnalysisEdge) -> bool);
+
+struct ComponentIndexes<'a> {
+    filenames: BTreeMap<&'a str, String>,
+    by_id: BTreeMap<&'a str, &'a Component>,
+    added_by_id: BTreeMap<&'a str, &'a Component>,
+    fields_by_table_id: BTreeMap<&'a str, Vec<&'a Component>>,
+    children_by_parent: BTreeMap<(&'a str, &'a str), Vec<&'a Component>>,
+    edges_by_object_id: BTreeMap<&'a str, Vec<&'a AnalysisEdge>>,
+}
+
+impl<'a> ComponentIndexes<'a> {
+    fn new(components: &'a [Component], edges: &'a [AnalysisEdge]) -> Self {
+        let mut indexes = Self {
+            filenames: BTreeMap::new(),
+            by_id: BTreeMap::new(),
+            added_by_id: BTreeMap::new(),
+            fields_by_table_id: BTreeMap::new(),
+            children_by_parent: BTreeMap::new(),
+            edges_by_object_id: BTreeMap::new(),
+        };
+        for (index, component) in components.iter().enumerate() {
+            indexes.filenames.insert(
+                component.record_id.as_str(),
+                format!(
+                    "{}/{:05}-{}-{}.md",
+                    component.kind,
+                    index + 1,
+                    component.kind,
+                    slug(&component.name)
+                ),
+            );
+            indexes
+                .by_id
+                .entry(component.object_id.as_str())
+                .or_insert(component);
+            if component.source_action == "AddAction" {
+                indexes
+                    .added_by_id
+                    .entry(component.object_id.as_str())
+                    .or_insert(component);
+            }
+            if component.kind == "field"
+                && let Some(table_id) = component.table_id.as_deref()
+            {
+                indexes
+                    .fields_by_table_id
+                    .entry(table_id)
+                    .or_default()
+                    .push(component);
+            }
+            if component.kind == "layout_object"
+                && let (Some(parent_id), Some(parent_record_id)) = (
+                    component.parent_object_id.as_deref(),
+                    component.parent_record_id.as_deref(),
+                )
+            {
+                indexes
+                    .children_by_parent
+                    .entry((parent_id, parent_record_id))
+                    .or_default()
+                    .push(component);
+            }
+        }
+        for edge in edges {
+            if let Some(id) = edge.from_object_id.as_deref() {
+                indexes.edges_by_object_id.entry(id).or_default().push(edge);
+            }
+            if let Some(id) = edge.to_object_id.as_deref()
+                && edge.from_object_id.as_deref() != Some(id)
+            {
+                indexes.edges_by_object_id.entry(id).or_default().push(edge);
+            }
+        }
+        indexes
+    }
+
+    fn page_path(&self, component: &Component) -> &str {
+        self.filenames
+            .get(component.record_id.as_str())
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    fn object(&self, id: &str) -> Option<&'a Component> {
+        self.added_by_id
+            .get(id)
+            .copied()
+            .or_else(|| self.by_id.get(id).copied())
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Analyze { input, out }) => run_analysis(input, out),
+        Some(Commands::Validate { bundle }) => validate_bundle(&bundle),
+        Some(Commands::Context {
+            bundle,
+            id,
+            depth,
+            max_objects,
+        }) => write_context_package(&bundle, &id, depth, max_objects),
         None if io::stdin().is_terminal() => run_analysis(Vec::new(), None),
         None => {
             let mut command = Cli::command();
@@ -142,6 +255,266 @@ fn main() -> Result<()> {
             )
         }
     }
+}
+
+fn validate_bundle(bundle: &Path) -> Result<()> {
+    if !bundle.is_dir() {
+        bail!(
+            "documentation bundle directory does not exist: {}",
+            bundle.display()
+        );
+    }
+    let root = fs::canonicalize(bundle)?;
+    let manifest_path = root.join("manifest.json");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .with_context(|| format!("missing {}", manifest_path.display()))?,
+    )?;
+    if manifest["schema_version"].as_u64() != Some(1) {
+        bail!("unsupported or missing bundle manifest schema version");
+    }
+    let files = manifest["files"]
+        .as_array()
+        .context("manifest files must be an array")?;
+    let mut paths = BTreeSet::new();
+    for item in files {
+        let relative = item
+            .as_str()
+            .context("manifest file path must be a string")?;
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("unsafe path in bundle manifest: {relative}");
+        }
+        if !paths.insert(relative.to_string()) {
+            bail!("duplicate path in bundle manifest: {relative}");
+        }
+        let path = root.join(relative_path);
+        if !path.is_file() {
+            bail!("manifest file is missing: {relative}");
+        }
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") => {
+                let _: serde::de::IgnoredAny =
+                    serde_json::from_reader(BufReader::new(File::open(&path)?))
+                        .with_context(|| format!("invalid JSON at {relative}"))?;
+            }
+            Some("jsonl") => {
+                for (line_number, line) in BufReader::new(File::open(&path)?).lines().enumerate() {
+                    let line = line?;
+                    serde_json::from_str::<serde_json::Value>(&line).with_context(|| {
+                        format!("invalid JSONL at {relative}:{}", line_number + 1)
+                    })?;
+                }
+            }
+            _ => {}
+        }
+    }
+    validate_markdown_links(&root, &paths)?;
+    let mut object_ids = BTreeSet::new();
+    let mut record_ids = BTreeSet::new();
+    for line in BufReader::new(File::open(root.join("objects.jsonl"))?).lines() {
+        let component: serde_json::Value = serde_json::from_str(&line?)?;
+        if let Some(id) = component["object_id"].as_str() {
+            object_ids.insert(id.to_string());
+        }
+        if let Some(id) = component["record_id"].as_str() {
+            record_ids.insert(id.to_string());
+        }
+        for record in component["attached_records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = record["record_id"].as_str() {
+                record_ids.insert(id.to_string());
+            }
+        }
+    }
+    for line in BufReader::new(File::open(root.join("edges.jsonl"))?).lines() {
+        let edge: serde_json::Value = serde_json::from_str(&line?)?;
+        for field in ["from_object_id", "to_object_id"] {
+            if let Some(id) = edge[field].as_str()
+                && !object_ids.contains(id)
+            {
+                bail!("edge references missing object ID {id}");
+            }
+        }
+        for field in ["from_record_id", "to_record_id"] {
+            if let Some(id) = edge[field].as_str()
+                && !record_ids.contains(id)
+            {
+                bail!("edge references missing record ID {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_markdown_links(root: &Path, paths: &BTreeSet<String>) -> Result<()> {
+    for relative in paths.iter().filter(|path| path.ends_with(".md")) {
+        let source = root.join(relative);
+        let markdown = fs::read_to_string(&source)?;
+        for (offset, _) in markdown.match_indices("](") {
+            let escape_count = markdown.as_bytes()[..offset]
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\\')
+                .count();
+            if escape_count % 2 == 1 {
+                continue;
+            }
+            let target = markdown[offset + 2..]
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if target.is_empty()
+                || target.starts_with('#')
+                || target.contains("://")
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            let local = target.split('#').next().unwrap_or_default();
+            if local.is_empty() {
+                continue;
+            }
+            let resolved = fs::canonicalize(source.parent().unwrap_or(root).join(local))
+                .with_context(|| format!("broken Markdown link in {relative}: {target}"))?;
+            if !resolved.starts_with(root) {
+                bail!("Markdown link escapes bundle from {relative}: {target}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_context_package(bundle: &Path, id: &str, depth: usize, max_objects: usize) -> Result<()> {
+    if max_objects == 0 {
+        bail!("--max-objects must be greater than zero");
+    }
+    let objects: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.join("objects.json"))?)?;
+    let edges: serde_json::Value = serde_json::from_slice(&fs::read(bundle.join("edges.json"))?)?;
+    let workflows: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.join("workflows/workflows.json"))?)?;
+    let components = objects["components"]
+        .as_array()
+        .context("objects.components must be an array")?;
+    let object_ids: BTreeSet<_> = components
+        .iter()
+        .filter_map(|component| component["object_id"].as_str())
+        .collect();
+    let workflow = workflows["workflows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|workflow| workflow["id"].as_str() == Some(id));
+    let mut roots = BTreeSet::new();
+    if let Some(workflow) = workflow {
+        for key in [
+            "entry_object_id",
+            "script_ids",
+            "layout_ids",
+            "field_read_ids",
+            "field_write_ids",
+            "table_occurrence_ids",
+            "external_source_ids",
+        ] {
+            if let Some(single) = workflow[key].as_str() {
+                roots.insert(single);
+            }
+            for related in workflow[key].as_array().into_iter().flatten() {
+                if let Some(related) = related.as_str() {
+                    roots.insert(related);
+                }
+            }
+        }
+    } else if object_ids.contains(id) {
+        roots.insert(id);
+    } else {
+        bail!("no object or workflow with ID {id} was found in the bundle");
+    }
+
+    let mut included = BTreeSet::new();
+    let mut continuation = BTreeSet::new();
+    let mut pending: VecDeque<_> = roots.iter().map(|object_id| (*object_id, 0usize)).collect();
+    while let Some((object_id, current_depth)) = pending.pop_front() {
+        if !object_ids.contains(object_id) {
+            continue;
+        }
+        if included.contains(object_id) {
+            continue;
+        }
+        if included.len() >= max_objects {
+            continuation.insert(object_id.to_string());
+            continue;
+        }
+        included.insert(object_id.to_string());
+        if current_depth >= depth {
+            continue;
+        }
+        for edge in edges["edges"].as_array().into_iter().flatten() {
+            let from = edge["from_object_id"].as_str();
+            let to = edge["to_object_id"].as_str();
+            if from == Some(object_id)
+                && let Some(to) = to
+                && object_ids.contains(to)
+            {
+                pending.push_back((to, current_depth + 1));
+            }
+            if to == Some(object_id)
+                && let Some(from) = from
+                && object_ids.contains(from)
+            {
+                pending.push_back((from, current_depth + 1));
+            }
+        }
+    }
+    for (object_id, _) in pending {
+        continuation.insert(object_id.to_string());
+    }
+    let selected_components: Vec<_> = components
+        .iter()
+        .filter(|component| {
+            component["object_id"]
+                .as_str()
+                .is_some_and(|object_id| included.contains(object_id))
+        })
+        .collect();
+    let selected_edges: Vec<_> = edges["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|edge| {
+            edge["from_object_id"]
+                .as_str()
+                .is_some_and(|object_id| included.contains(object_id))
+                || edge["to_object_id"]
+                    .as_str()
+                    .is_some_and(|object_id| included.contains(object_id))
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "root_id": id,
+            "root_kind": if workflow.is_some() { "workflow" } else { "object" },
+            "depth": depth,
+            "max_objects": max_objects,
+            "truncated": !continuation.is_empty(),
+            "continuation_ids": continuation,
+            "workflow": workflow,
+            "objects": selected_components,
+            "edges": selected_edges,
+        }))?
+    );
+    Ok(())
 }
 
 fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
@@ -212,6 +585,7 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
         known_catalogs_not_observed,
         diagnostics,
     };
+    analyze_calculation_features(&mut components);
     let mut edges = analyze_scripts(&mut components);
     edges.extend(analyze_component_references(&components));
     edges.sort_by(|left, right| {
@@ -223,6 +597,7 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
             .then(left.evidence.cmp(&right.evidence))
     });
     let workflows = discover_workflows(&components, &edges);
+    let indexes = ComponentIndexes::new(&components, &edges);
 
     fs::create_dir_all(&output)
         .with_context(|| format!("cannot create output directory {}", output.display()))?;
@@ -246,9 +621,17 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
             edges: &edges,
         })?,
     )?;
-    write_component_docs(&output, &components, &edges)?;
-    write_permission_matrix(&output, &components)?;
-    write_integration_docs(&output, &components, &edges, &workflows)?;
+    write_component_docs(&output, &components, &indexes)?;
+    write_permission_matrix(&output, &components, &indexes)?;
+    write_integration_docs(&output, &components, &workflows, &indexes)?;
+    write_pre_html_bundle(
+        &output,
+        &inventory,
+        &components,
+        &edges,
+        &workflows,
+        &indexes,
+    )?;
     println!("Inventory written to {}", output.display());
     Ok(())
 }
@@ -256,8 +639,8 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
 fn write_integration_docs(
     output: &Path,
     components: &[Component],
-    edges: &[AnalysisEdge],
     workflows: &[WorkflowCandidate],
+    indexes: &ComponentIndexes<'_>,
 ) -> Result<()> {
     let integrations = output.join("integrations");
     fs::create_dir_all(&integrations)?;
@@ -272,8 +655,11 @@ fn write_integration_docs(
         markdown.push_str("No external data-source records were present.\n");
     }
     for source in sources {
-        let references: Vec<_> = edges
-            .iter()
+        let references: Vec<_> = indexes
+            .edges_by_object_id
+            .get(source.object_id.as_str())
+            .into_iter()
+            .flatten()
             .filter(|edge| {
                 edge.kind == "accesses_external_source"
                     && edge.to_object_id.as_deref() == Some(source.object_id.as_str())
@@ -281,7 +667,7 @@ fn write_integration_docs(
             .collect();
         markdown.push_str(&format!(
             "- **{}** (`{}`; action `{}`): {} explicit reference(s). Source record: `objects/{}`.\n",
-            md(&source.name), md(&source.object_id), md(&source.source_action), references.len(), component_page_relative_path(source, components)
+            md(&source.name), md(&source.object_id), md(&source.source_action), references.len(), indexes.page_path(source)
         ));
     }
     markdown.push_str("\n## Script effects associated with integrations\n\n");
@@ -350,22 +736,13 @@ fn write_integration_docs(
     }
     for (number, workflow) in workflows.iter().enumerate() {
         let filename = format!("{:04}-{}.md", number + 1, slug(&workflow.entry_name));
-        let entry_link = components
-            .iter()
-            .find(|component| {
-                component.object_id == workflow.entry_object_id
-                    && component.source_action == "AddAction"
-            })
-            .or_else(|| {
-                components
-                    .iter()
-                    .find(|component| component.object_id == workflow.entry_object_id)
-            })
+        let entry_link = indexes
+            .object(&workflow.entry_object_id)
             .map(|component| {
                 format!(
                     "[{}](../objects/{})",
                     md(&component_display_name(component)),
-                    component_page_relative_path(component, components)
+                    indexes.page_path(component)
                 )
             })
             .unwrap_or_else(|| {
@@ -400,21 +777,12 @@ fn write_integration_docs(
                 page.push_str("None resolved.\n");
             } else {
                 for id in ids {
-                    let object = components
-                        .iter()
-                        .find(|component| {
-                            component.object_id == *id && component.source_action == "AddAction"
-                        })
-                        .or_else(|| {
-                            components
-                                .iter()
-                                .find(|component| component.object_id == *id)
-                        });
+                    let object = indexes.object(id);
                     if let Some(object) = object {
                         page.push_str(&format!(
                             "- [{}](../objects/{}) (`{}`)\n",
                             md(&component_display_name(object)),
-                            component_page_relative_path(object, components),
+                            indexes.page_path(object),
                             md(id)
                         ));
                     } else {
@@ -446,6 +814,602 @@ fn write_integration_docs(
         fs::write(workflow_dir.join(filename), page)?;
     }
     fs::write(workflow_dir.join("index.md"), index)?;
+    Ok(())
+}
+
+fn write_pre_html_bundle(
+    output: &Path,
+    inventory: &Inventory,
+    components: &[Component],
+    edges: &[AnalysisEdge],
+    workflows: &[WorkflowCandidate],
+    indexes: &ComponentIndexes<'_>,
+) -> Result<()> {
+    for directory in [
+        "schemas",
+        "architecture",
+        "data",
+        "graphs",
+        "migration",
+        "agent",
+        "reports",
+    ] {
+        fs::create_dir_all(output.join(directory))?;
+    }
+    for (name, schema) in [
+        (
+            "application.schema.json",
+            include_str!("../schemas/application.schema.json"),
+        ),
+        (
+            "objects.schema.json",
+            include_str!("../schemas/objects.schema.json"),
+        ),
+        (
+            "edges.schema.json",
+            include_str!("../schemas/edges.schema.json"),
+        ),
+        (
+            "graph.schema.json",
+            include_str!("../schemas/graph.schema.json"),
+        ),
+        (
+            "workflows.schema.json",
+            include_str!("../schemas/workflows.schema.json"),
+        ),
+        (
+            "object.schema.json",
+            include_str!("../schemas/object.schema.json"),
+        ),
+        (
+            "edge.schema.json",
+            include_str!("../schemas/edge.schema.json"),
+        ),
+        (
+            "workflow.schema.json",
+            include_str!("../schemas/workflow.schema.json"),
+        ),
+        (
+            "coverage.schema.json",
+            include_str!("../schemas/coverage.schema.json"),
+        ),
+        (
+            "diagnostics.schema.json",
+            include_str!("../schemas/diagnostics.schema.json"),
+        ),
+        (
+            "diagnostic.schema.json",
+            include_str!("../schemas/diagnostic.schema.json"),
+        ),
+        (
+            "requirements.schema.json",
+            include_str!("../schemas/requirements.schema.json"),
+        ),
+        (
+            "context-map.schema.json",
+            include_str!("../schemas/context-map.schema.json"),
+        ),
+        (
+            "context-package.schema.json",
+            include_str!("../schemas/context-package.schema.json"),
+        ),
+        (
+            "task-units.schema.json",
+            include_str!("../schemas/task-units.schema.json"),
+        ),
+        (
+            "testing-scenario.schema.json",
+            include_str!("../schemas/testing-scenario.schema.json"),
+        ),
+    ] {
+        fs::write(output.join("schemas").join(name), schema)?;
+    }
+    fs::write(
+        output.join("schemas/compatibility.md"),
+        include_str!("../docs/schema-compatibility.md"),
+    )?;
+
+    fs::write(
+        output.join("application.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": inventory.schema_version,
+            "source_format": inventory.source_format,
+            "applications": &inventory.applications,
+            "catalogs": &inventory.catalogs,
+            "known_catalogs_not_observed": &inventory.known_catalogs_not_observed,
+            "diagnostics": &inventory.diagnostics,
+        }))?,
+    )?;
+    write_jsonl(output.join("objects.jsonl").as_path(), components)?;
+    write_jsonl(output.join("edges.jsonl").as_path(), edges)?;
+
+    let component_counts = count_labels(components.iter().map(|component| component.kind.as_str()));
+    let edge_counts = count_labels(edges.iter().map(|edge| edge.kind.as_str()));
+    let finding_counts = count_labels(components.iter().flat_map(|component| {
+        component
+            .findings
+            .iter()
+            .map(|finding| finding.kind.as_str())
+    }));
+    let mut xml_element_counts = BTreeMap::new();
+    for component in components {
+        collect_xml_element_counts(&component.properties, &mut xml_element_counts);
+        for record in &component.attached_records {
+            collect_xml_element_counts(&record.properties, &mut xml_element_counts);
+        }
+    }
+    let limitations = vec![
+        serde_json::json!({"feature":"calculation language","status":"partial","description":"Only structured chunks and conservative qualified-name heuristics are analyzed; formulas are not evaluated."}),
+        serde_json::json!({"feature":"script runtime","status":"partial","description":"Control flow and call graph are static; dynamic destinations, state, timing, and runtime outcomes are unresolved."}),
+        serde_json::json!({"feature":"workflow reconstruction","status":"partial","description":"Candidates are reachability summaries, not verified user journeys or business processes."}),
+        serde_json::json!({"feature":"effective authorization","status":"uncertain","description":"Exported privilege actions are transcribed separately; partial changes are not merged into an effective runtime policy."}),
+        serde_json::json!({"feature":"external integrations","status":"partial","description":"Static URLs and external-source references do not establish endpoint validity or successful access."}),
+        serde_json::json!({"feature":"runtime records","status":"unsupported","description":"Save-a-Copy-as-XML describes design metadata and does not contain application record data."}),
+    ];
+    let coverage = serde_json::json!({
+        "schema_version": 1,
+        "catalogs": {"observed": &inventory.catalogs, "not_observed": &inventory.known_catalogs_not_observed, "unknown_catalog_items": component_counts.get("unknown_catalog_item").copied().unwrap_or(0)},
+        "component_counts": component_counts,
+        "edge_counts": edge_counts,
+        "edge_status_counts": count_labels(edges.iter().map(|edge| edge.status.as_str())),
+        "finding_counts": finding_counts,
+        "preserved_xml_element_counts": xml_element_counts,
+        "limitations": limitations,
+    });
+    fs::write(
+        output.join("coverage.json"),
+        serde_json::to_vec_pretty(&coverage)?,
+    )?;
+
+    let mut diagnostics = Vec::new();
+    for diagnostic in &inventory.diagnostics {
+        diagnostics.push(serde_json::json!({"kind":"inventory_diagnostic","status":"unresolved","summary":diagnostic,"source_object_id":null,"target_object_id":null,"evidence":[],"limitations":[]}));
+    }
+    for component in components {
+        for diagnostic in &component.diagnostics {
+            diagnostics.push(serde_json::json!({"kind":"component_diagnostic","status":"unresolved","summary":diagnostic,"source_object_id":component.object_id,"target_object_id":null,"evidence":[component.source_path],"limitations":[]}));
+        }
+        for finding in &component.findings {
+            if matches!(
+                finding.status.as_str(),
+                "heuristic_candidate" | "unresolved"
+            ) {
+                diagnostics.push(serde_json::json!({"kind":finding.kind,"status":finding.status,"summary":finding.summary,"source_object_id":component.object_id,"target_object_id":null,"evidence":finding.evidence,"limitations":finding.limitations}));
+            }
+        }
+    }
+    for edge in edges
+        .iter()
+        .filter(|edge| matches!(edge.status.as_str(), "heuristic_candidate" | "unresolved"))
+    {
+        diagnostics.push(serde_json::json!({"kind":edge.kind,"status":edge.status,"summary":format!("{} reference is {}", edge.kind, edge.status),"source_object_id":edge.from_object_id,"target_object_id":edge.to_object_id,"evidence":edge.evidence,"limitations":edge.limitations}));
+    }
+    diagnostics.sort_by_key(|diagnostic| serde_json::to_string(diagnostic).unwrap_or_default());
+    for (index, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic["id"] = serde_json::json!(format!("diag:{:06}", index + 1));
+    }
+    fs::write(
+        output.join("diagnostics.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"schema_version":1,"diagnostics":diagnostics}),
+        )?,
+    )?;
+    write_analysis_graphs(output, edges, workflows)?;
+    write_architecture_docs(output, inventory, components, edges, workflows, indexes)?;
+    write_migration_docs(output, components, workflows, indexes)?;
+    write_agent_bundle(output, components, workflows, &diagnostics, indexes)?;
+
+    let reports = output.join("reports");
+    let edge_status = count_labels(edges.iter().map(|edge| edge.status.as_str()));
+    let mut quality = format!(
+        "# Analysis quality\n\n- Applications: {}\n- Components: {}\n- Relationships: {}\n- Workflows: {}\n- Unresolved edges: {}\n- Heuristic candidate edges: {}\n\nCounts describe source records and static findings, not final runtime state. See [coverage.json](../coverage.json) and [diagnostics.json](../diagnostics.json).\n",
+        inventory.applications.len(),
+        components.len(),
+        edges.iter().filter(|edge| edge.kind == "joins_to").count(),
+        workflows.len(),
+        edge_status.get("unresolved").copied().unwrap_or(0),
+        edge_status.get("heuristic_candidate").copied().unwrap_or(0)
+    );
+    quality.push_str("\n## Known interpretation limits\n\nCalculations are not evaluated. Workflow and call reachability do not establish execution. Privilege settings remain separated by exported action. Missing catalogs can mean excluded or empty content.\n");
+    fs::write(reports.join("analysis-quality.md"), quality)?;
+    let mut unsupported = String::from(
+        "# Unsupported and incomplete analysis\n\n| Area | Status | Limitation |\n|---|---|---|\n",
+    );
+    for limitation in coverage["limitations"].as_array().into_iter().flatten() {
+        unsupported.push_str(&format!(
+            "| {} | `{}` | {} |\n",
+            md(limitation["feature"].as_str().unwrap_or("unknown")),
+            limitation["status"].as_str().unwrap_or("uncertain"),
+            md(limitation["description"].as_str().unwrap_or(""))
+        ));
+    }
+    fs::write(reports.join("unsupported-features.md"), unsupported)?;
+    let mut unresolved = String::from(
+        "# Unresolved and heuristic references\n\nReferences retain uncertainty and are not promoted to confirmed links.\n\n| Status | Kind | From | To | Evidence | Limitation |\n|---|---|---|---|---|---|\n",
+    );
+    for edge in edges
+        .iter()
+        .filter(|edge| matches!(edge.status.as_str(), "unresolved" | "heuristic_candidate"))
+    {
+        unresolved.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | {} | {} |\n",
+            edge.status,
+            md(&edge.kind),
+            md(edge.from_object_id.as_deref().unwrap_or("—")),
+            md(edge.to_object_id.as_deref().unwrap_or("—")),
+            md(&edge.evidence.join("; ")),
+            md(&edge.limitations.join("; "))
+        ));
+    }
+    fs::write(reports.join("unresolved-references.md"), unresolved)?;
+
+    let mut readme = String::from(
+        "# FileMaker migration blueprint\n\nThis bundle is generated offline from design XML. It does not contain application records and does not prove runtime behavior. Start with the coverage report, then follow evidence links into component pages.\n\n## Main reports\n\n- [Architecture overview](architecture/overview.md)\n- [Data dictionary](data/data-dictionary.md)\n- [Security matrix](security/permission-matrix.md)\n- [Integration inventory](integrations/overview.md)\n- [Workflow candidates](workflows/index.md)\n- [Migration notes](migration/README.md)\n- [Coverage and uncertainty](coverage.json)\n- [Diagnostics](diagnostics.json)\n- [Agent guide](agent/AGENTS.md)\n\nValidate this bundle with `fmblueprint validate <bundle>`. Export bounded context with `fmblueprint context <bundle> --id <object-or-workflow-id> --depth 2 --max-objects 250`.\n",
+    );
+    readme.push_str("\nSchemas are versioned per artifact family in `schemas/`; see the repository compatibility policy before consuming them.\n");
+    fs::write(output.join("README.md"), readme)?;
+    write_manifest(output, inventory)?;
+    Ok(())
+}
+
+fn count_labels<'a>(labels: impl Iterator<Item = &'a str>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for label in labels {
+        *counts.entry(label.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn collect_xml_element_counts(node: &XmlNode, counts: &mut BTreeMap<String, usize>) {
+    *counts.entry(node.name.clone()).or_insert(0) += 1;
+    for child in &node.children {
+        collect_xml_element_counts(child, counts);
+    }
+}
+
+fn write_jsonl<T: Serialize>(path: &Path, rows: impl IntoIterator<Item = T>) -> Result<()> {
+    let mut file = File::create(path)?;
+    for row in rows {
+        serde_json::to_writer(&mut file, &row)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_analysis_graphs(
+    output: &Path,
+    edges: &[AnalysisEdge],
+    workflows: &[WorkflowCandidate],
+) -> Result<()> {
+    let directory = output.join("graphs");
+    let graphs: [GraphSelector; 4] = [
+        ("relationships.json", |edge| {
+            matches!(
+                edge.kind.as_str(),
+                "joins_to" | "references_table" | "uses_table_occurrence"
+            )
+        }),
+        ("script-calls.json", |edge| edge.kind == "calls_script"),
+        ("navigation.json", |edge| {
+            matches!(
+                edge.kind.as_str(),
+                "navigates_to" | "triggers_script" | "is_triggered_by"
+            )
+        }),
+        ("dependencies.json", |_| true),
+    ];
+    for (name, include) in graphs {
+        let selected: Vec<_> = edges.iter().filter(|edge| include(edge)).collect();
+        fs::write(
+            directory.join(name),
+            serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"edges":selected}))?,
+        )?;
+    }
+    fs::write(
+        directory.join("workflows.json"),
+        serde_json::to_vec_pretty(&WorkflowExport {
+            schema_version: 2,
+            workflows,
+        })?,
+    )?;
+    Ok(())
+}
+
+fn write_architecture_docs(
+    output: &Path,
+    inventory: &Inventory,
+    components: &[Component],
+    edges: &[AnalysisEdge],
+    workflows: &[WorkflowCandidate],
+    indexes: &ComponentIndexes<'_>,
+) -> Result<()> {
+    let directory = output.join("architecture");
+    let mut overview = String::from(
+        "# Architecture overview\n\nThe export contains design metadata only. Base tables and table occurrences are represented separately; relationship edges preserve occurrence context. Static analysis does not execute scripts or calculations.\n\n## Source files\n\n| File | UUID | FileMaker | Export | DDR_INFO |\n|---|---|---|---|---|\n",
+    );
+    for app in &inventory.applications {
+        overview.push_str(&format!(
+            "| {} | `{}` | {} | {} | {} |\n",
+            md(app.file_name.as_deref().unwrap_or("unknown")),
+            md(app.uuid.as_deref().unwrap_or("unknown")),
+            md(app.filemaker_version.as_deref().unwrap_or("unknown")),
+            md(app.export_version.as_deref().unwrap_or("unknown")),
+            app.ddr_info_present
+        ));
+    }
+    overview.push_str(&format!("\n{} components and {} typed edges were extracted. See [dependency map](dependency-map.md), [data flows](data-flows.md), [entry points](entry-points.md), and [coverage](../coverage.json).\n", components.len(), edges.len()));
+    fs::write(directory.join("overview.md"), overview)?;
+    let mut entries = String::from(
+        "# Candidate entry points\n\nThese are static UI trigger/navigation candidates. They are not confirmed user journeys.\n\n",
+    );
+    for (index, workflow) in workflows.iter().enumerate() {
+        let filename = format!("{:04}-{}.md", index + 1, slug(&workflow.entry_name));
+        entries.push_str(&format!(
+            "- [{}](../workflows/{filename}): {} (`{}`)\n",
+            md(&workflow.entry_name),
+            workflow.entry_kind,
+            workflow.status
+        ));
+    }
+    fs::write(directory.join("entry-points.md"), entries)?;
+    let mut dependencies = String::from("# Dependency map\n\n| Edge kind | Count |\n|---|---:|\n");
+    for (kind, count) in count_labels(edges.iter().map(|edge| edge.kind.as_str())) {
+        dependencies.push_str(&format!("| `{kind}` | {count} |\n"));
+    }
+    fs::write(directory.join("dependency-map.md"), dependencies)?;
+    let mut flows = String::from(
+        "# Data flows\n\n| Kind | Status | From | To | Evidence |\n|---|---|---|---|---|\n",
+    );
+    for edge in edges.iter().filter(|edge| {
+        matches!(
+            edge.kind.as_str(),
+            "reads_field"
+                | "writes_field"
+                | "uses_table_occurrence"
+                | "joins_to"
+                | "accesses_external_source"
+        )
+    }) {
+        flows.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            edge.kind,
+            edge.status,
+            md(edge.from_object_id.as_deref().unwrap_or("—")),
+            md(edge.to_object_id.as_deref().unwrap_or("—")),
+            md(&edge.evidence.join("; "))
+        ));
+    }
+    fs::write(directory.join("data-flows.md"), flows)?;
+
+    let mut dictionary = String::from(
+        "# Data dictionary\n\nThis is a literal FileMaker schema index; names do not establish domain meaning.\n\n| Table | Field | XML type | Source action | Component page |\n|---|---|---|---|---|\n",
+    );
+    for field in components
+        .iter()
+        .filter(|component| component.kind == "field")
+    {
+        let xml_type = first_named_property(&field.properties, "Field")
+            .and_then(|node| {
+                node.attributes
+                    .get("datatype")
+                    .or_else(|| node.attributes.get("dataType"))
+            })
+            .map(String::as_str)
+            .unwrap_or("not specified");
+        dictionary.push_str(&format!(
+            "| {} | {} | {} | `{}` | [details](../objects/{}) |\n",
+            md(field.table_name.as_deref().unwrap_or("unresolved table")),
+            md(&field.name),
+            md(xml_type),
+            md(&field.source_action),
+            indexes.page_path(field)
+        ));
+    }
+    fs::write(output.join("data").join("data-dictionary.md"), dictionary)?;
+    Ok(())
+}
+
+fn first_named_property<'a>(node: &'a XmlNode, name: &str) -> Option<&'a XmlNode> {
+    if node.name == name {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| first_named_property(child, name))
+}
+
+fn write_migration_docs(
+    output: &Path,
+    components: &[Component],
+    workflows: &[WorkflowCandidate],
+    indexes: &ComponentIndexes<'_>,
+) -> Result<()> {
+    let directory = output.join("migration");
+    let readme = String::from(
+        "# Migration blueprint (framework-neutral)\n\nThese documents describe observed design facts and candidate implementation slices. They are not a target-framework design or verified business requirements.\n\n- [Feature inventory](feature-inventory.md)\n- [Requirements and static findings](requirements-derived.md)\n- [Screens](screens.md)\n- [Data contracts](data-contracts.md)\n- [Security contracts](security-contracts.md)\n- [Integration contracts](integration-contracts.md)\n- [Candidate test scenarios](testing-scenarios.md)\n- [Suggested implementation order](implementation-order.md)\n- [Limitations and decisions](limitations-and-decisions.md)\n",
+    );
+    fs::write(directory.join("README.md"), readme)?;
+    fs::write(
+        directory.join("feature-inventory.md"),
+        "# Feature inventory\n\nCounts and observed feature families are in [coverage.json](../coverage.json). Unsupported and uncertain behavior is listed in [reports/unsupported-features.md](../reports/unsupported-features.md).\n",
+    )?;
+    fs::write(
+        directory.join("requirements-derived.md"),
+        "# Derived findings\n\n`agent/requirements.jsonl` contains static findings, not business requirements. Each entry retains source object IDs, evidence paths, epistemic status, and limitations. Human discovery is required before treating any finding as a product requirement.\n",
+    )?;
+    let mut screens = String::from(
+        "# Screen inventory\n\nLayouts are literal source records. Object coordinates and trigger behavior remain attached to their component pages.\n\n| Layout | Action | Source |\n|---|---|---|\n",
+    );
+    for layout in components
+        .iter()
+        .filter(|component| component.kind == "layout")
+    {
+        screens.push_str(&format!(
+            "| [{}](../objects/{}) | `{}` | `{}` |\n",
+            md(&component_display_name(layout)),
+            indexes.page_path(layout),
+            layout.source_action,
+            md(&layout.source_path)
+        ));
+    }
+    fs::write(directory.join("screens.md"), screens)?;
+    let data = String::from(
+        "# Data contracts\n\nThe XML defines fields and table context, not record payloads or API contracts. Treat this list as a schema inventory pending application-level validation. See [data dictionary](../data/data-dictionary.md).\n",
+    );
+    fs::write(directory.join("data-contracts.md"), data)?;
+    fs::write(
+        directory.join("security-contracts.md"),
+        "# Security contracts\n\nSee [exported access matrix](../security/permission-matrix.md). The matrix preserves privilege source actions and explicit table/object rules; it does not compute effective runtime access or evaluate data-dependent calculations.\n",
+    )?;
+    fs::write(
+        directory.join("integration-contracts.md"),
+        "# Integration contracts\n\nSee [integration inventory](../integrations/overview.md). Endpoint literals and external-source paths remain inert evidence and are not validated or executed.\n",
+    )?;
+    fs::write(
+        directory.join("implementation-order.md"),
+        "# Suggested implementation order\n\n1. Confirm source-file identity, table occurrences, relationships, and field definitions.\n2. Validate account assignments and privilege rules with application owners.\n3. Reconstruct screen and workflow behavior from candidate entries and runtime scenarios.\n4. Implement data mutations and integrations only after their unresolved behavior is confirmed.\n\nThis ordering is a planning hint derived from static coverage, not a target architecture.\n",
+    )?;
+    fs::write(
+        directory.join("limitations-and-decisions.md"),
+        "# Limitations and decisions\n\n- Preserve Add/Modify/Remove source actions separately; no final-state merge is inferred.\n- Treat name-matched calculations and cross-file UUID matches as heuristic candidates.\n- Do not execute calculations, scripts, web-viewer content, SQL, or plug-ins.\n- Obtain paired Save-a-Copy XML with `DDR_INFO` and DDR XML only if a coverage comparison is needed; DDR is not required for this output contract.\n",
+    )?;
+    let mut scenarios = String::from(
+        "# Candidate validation scenarios\n\nThese seeds validate observable behavior later; static effects are not expected runtime outcomes.\n\n",
+    );
+    for workflow in workflows {
+        scenarios.push_str(&format!("## {}\n\n- Entry object: `{}`\n- Candidate static effects: {}\n- Questions to verify: {}\n\n", md(&workflow.entry_name), md(&workflow.entry_object_id), if workflow.effects.is_empty() { "none classified".to_string() } else { workflow.effects.iter().map(|effect| md(effect)).collect::<Vec<_>>().join("; ") }, workflow.limitations.iter().map(|limitation| md(limitation)).collect::<Vec<_>>().join("; ")));
+    }
+    fs::write(directory.join("testing-scenarios.md"), scenarios)?;
+    Ok(())
+}
+
+fn write_agent_bundle(
+    output: &Path,
+    components: &[Component],
+    workflows: &[WorkflowCandidate],
+    diagnostics: &[serde_json::Value],
+    indexes: &ComponentIndexes<'_>,
+) -> Result<()> {
+    let directory = output.join("agent");
+    fs::write(
+        directory.join("AGENTS.md"),
+        "# Agent guide\n\nUse `context-map.json` to locate objects and first-degree dependencies. Read component Markdown for preserved source properties and evidence. Use graph JSON for typed relationships. Run `fmblueprint context <bundle> --id <id> --depth 2 --max-objects 250` to emit a bounded context package; inspect `continuation_ids` if truncated. Interpret `explicit` as present in XML, `derived` as structural analysis, `heuristic_candidate` as a name/UUID-based lead, and `unresolved` as missing or ambiguous. Never promote heuristic findings into verified requirements. No artifact contains runtime records.\n",
+    )?;
+    fs::write(
+        directory.join("INDEX.md"),
+        "# Agent artifacts\n\n- `context-map.json`: object IDs, docs, and graph neighbors.\n- `requirements.jsonl`: evidence-backed static findings, not business requirements.\n- `unknowns.jsonl`: unresolved and heuristic analysis questions (`schemas/diagnostic.schema.json`).\n- `task-units.json`: suggested migration work slices.\n- `testing-scenarios.jsonl`: workflow validation seeds.\n- `schemas/context-package.schema.json`: bounded context output contract.\n",
+    )?;
+    let mut context_objects = Vec::new();
+    for component in components {
+        let related_edges = indexes.edges_by_object_id.get(component.object_id.as_str());
+        let outgoing: BTreeSet<_> = related_edges
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.from_object_id.as_deref() == Some(component.object_id.as_str()))
+            .filter_map(|edge| edge.to_object_id.clone())
+            .collect();
+        let incoming: BTreeSet<_> = related_edges
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.to_object_id.as_deref() == Some(component.object_id.as_str()))
+            .filter_map(|edge| edge.from_object_id.clone())
+            .collect();
+        context_objects.push(serde_json::json!({"id":component.object_id,"record_id":component.record_id,"kind":component.kind,"name":component.name,"source_file":component.source_file,"status":if component.findings.iter().any(|finding| finding.status == "unresolved") { "partially_unresolved" } else { "documented" },"document":format!("../objects/{}",indexes.page_path(component)),"outgoing":outgoing,"incoming":incoming,"source_path":component.source_path}));
+    }
+    fs::write(
+        directory.join("context-map.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"schema_version":1,"depth_hint":1,"objects":context_objects}),
+        )?,
+    )?;
+    let mut requirements = Vec::new();
+    for component in components {
+        for (index, finding) in component.findings.iter().enumerate() {
+            requirements.push(serde_json::json!({"id":format!("finding:{}:{}:{:04}",component.record_id,finding.kind,index+1),"kind":"static_finding","statement":finding.summary,"status":finding.status,"source_objects":[component.object_id],"evidence":finding.evidence,"dependencies":[],"unknowns":finding.limitations}));
+        }
+    }
+    write_jsonl(directory.join("requirements.jsonl").as_path(), requirements)?;
+    let unknowns: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic["status"].as_str(),
+                Some("unresolved" | "heuristic_candidate")
+            )
+        })
+        .cloned()
+        .collect();
+    write_jsonl(directory.join("unknowns.jsonl").as_path(), unknowns)?;
+    let tasks = [
+        (
+            "data-model",
+            "Validate tables, fields, occurrences and join predicates",
+            "data",
+        ),
+        (
+            "security",
+            "Review accounts and privilege rules",
+            "security",
+        ),
+        (
+            "screens",
+            "Validate layout objects and navigation candidates",
+            "ui",
+        ),
+        (
+            "integrations",
+            "Confirm external sources and script effects",
+            "integration",
+        ),
+        (
+            "workflows",
+            "Validate candidate paths and runtime conditions",
+            "workflow",
+        ),
+    ];
+    let task_units: Vec<_> = tasks.iter().map(|(id, title, kind)| serde_json::json!({"id":format!("task:{id}"),"title":title,"kind":kind,"status":"planning_hint","source_object_ids":components.iter().filter(|component| match *kind { "data" => matches!(component.kind.as_str(),"table"|"field"|"table_occurrence"|"relationship"),"security" => matches!(component.kind.as_str(),"account"|"privilege_set"),"ui" => matches!(component.kind.as_str(),"layout"|"layout_object"|"custom_menu"),"integration" => component.kind == "external_data_source","workflow" => component.kind == "script", _ => false }).map(|component| component.object_id.clone()).collect::<BTreeSet<_>>(),"depends_on":if *id == "data-model" { Vec::<String>::new() } else { vec!["task:data-model".to_string()] }})).collect();
+    fs::write(
+        directory.join("task-units.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"tasks":task_units}))?,
+    )?;
+    let scenarios: Vec<_> = workflows.iter().map(|workflow| serde_json::json!({"id":format!("scenario:{}",workflow.id),"kind":"workflow_validation_seed","status":workflow.status,"entry_object_id":workflow.entry_object_id,"actions":[format!("Exercise UI entry {} in a controlled FileMaker runtime",workflow.entry_object_id)],"observed_static_effects":workflow.effects,"open_questions":workflow.limitations,"evidence":workflow.evidence})).collect();
+    write_jsonl(
+        directory.join("testing-scenarios.jsonl").as_path(),
+        scenarios,
+    )?;
+    Ok(())
+}
+
+fn collect_output_files(directory: &Path, root: &Path, files: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_output_files(&path, root, files)?;
+        } else if entry.file_type()?.is_file() {
+            files.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest(output: &Path, inventory: &Inventory) -> Result<()> {
+    let mut files = Vec::new();
+    collect_output_files(output, output, &mut files)?;
+    files.push("manifest.json".to_string());
+    files.sort();
+    files.dedup();
+    fs::write(
+        output.join("manifest.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"schema_version":1,"generator":"fmblueprint","generator_version":env!("CARGO_PKG_VERSION"),"source_format":inventory.source_format,"inputs":inventory.applications.iter().map(|app| serde_json::json!({"file_name":app.file_name,"uuid":app.uuid,"filemaker_version":app.filemaker_version,"export_version":app.export_version})).collect::<Vec<_>>(),"artifact_schemas":{"application":2,"object":2,"objects_export":2,"edge":2,"edges_export":2,"graph":1,"workflow":2,"workflows_export":2,"coverage":1,"diagnostic":1,"diagnostics":1,"agent_context":1,"context_package":1,"agent_tasks":1,"agent_requirements":1,"agent_unknown":1,"agent_scenario":1},"files":files}),
+        )?,
+    )?;
     Ok(())
 }
 
@@ -873,14 +1837,14 @@ fn render_markdown(inventory: &Inventory) -> String {
     }
     markdown.push_str("## Coverage\n\nCatalog inventory reports source entries by file and action. Component pages preserve available XML properties for extracted catalogs; account names and privilege-set roles are included, while passwords and credentials are redacted. Explicit references are resolved where the target is present and unambiguous; runtime behavior is not inferred.\n");
     markdown
-        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json) · [Permission matrix](security/permission-matrix.md) · [Integrations](integrations/overview.md) · [Workflow candidates](workflows/index.md)\n");
+        .push_str("\n[Component pages](objects/index.md) · [Typed relationships](edges.json) · [Permission matrix](security/permission-matrix.md) · [Integrations](integrations/overview.md) · [Workflow candidates](workflows/index.md) · [Coverage](coverage.json) · [Migration blueprint](migration/README.md) · [Agent guide](agent/AGENTS.md) · [Bundle README](README.md)\n");
     markdown
 }
 
 fn write_component_docs(
     output: &Path,
     components: &[Component],
-    edges: &[AnalysisEdge],
+    indexes: &ComponentIndexes<'_>,
 ) -> Result<()> {
     let directory = output.join("objects");
     fs::create_dir_all(&directory).with_context(|| {
@@ -889,23 +1853,8 @@ fn write_component_docs(
             directory.display()
         )
     })?;
-    let filenames: BTreeMap<&str, String> = components
-        .iter()
-        .enumerate()
-        .map(|(index, component)| {
-            (
-                component.record_id.as_str(),
-                format!(
-                    "{}/{:05}-{}-{}.md",
-                    component.kind,
-                    index + 1,
-                    component.kind,
-                    slug(&component.name)
-                ),
-            )
-        })
-        .collect();
-    let current_pages: std::collections::BTreeSet<String> = filenames.values().cloned().collect();
+    let current_pages: std::collections::BTreeSet<String> =
+        indexes.filenames.values().cloned().collect();
     let tables: BTreeMap<&str, &Component> = components
         .iter()
         .filter(|component| component.kind == "table" && component.source_action == "AddAction")
@@ -913,7 +1862,7 @@ fn write_component_docs(
         .collect();
     let mut index = String::from("# Extracted components\n\n");
     for component in components {
-        let filename = &filenames[component.record_id.as_str()];
+        let filename = indexes.page_path(component);
         index.push_str(&format!(
             "- [{}](./{}): {} — `{}` (`{}`)\n",
             md(&component.name),
@@ -928,7 +1877,7 @@ fn write_component_docs(
         }
         fs::write(
             page_path,
-            render_component_page(component, &filenames, &tables, components, edges),
+            render_component_page(component, &tables, indexes),
         )
         .with_context(|| format!("cannot write component page {filename}"))?;
     }
@@ -945,7 +1894,11 @@ fn write_component_docs(
     Ok(())
 }
 
-fn write_permission_matrix(output: &Path, components: &[Component]) -> Result<()> {
+fn write_permission_matrix(
+    output: &Path,
+    components: &[Component],
+    indexes: &ComponentIndexes<'_>,
+) -> Result<()> {
     let directory = output.join("security");
     fs::create_dir_all(&directory)?;
     let mut markdown = String::from(
@@ -966,7 +1919,7 @@ fn write_permission_matrix(output: &Path, components: &[Component]) -> Result<()
                     md(&privilege_set.source_file),
                     md(&privilege_set.source_action),
                     md(&privilege_set.name),
-                    component_page_relative_path(privilege_set, components),
+                    indexes.page_path(privilege_set),
                     md(if accounts.is_empty() {
                         "—"
                     } else {
@@ -1011,7 +1964,7 @@ fn write_permission_matrix(output: &Path, components: &[Component]) -> Result<()
                     md(&privilege_set.source_file),
                     md(&privilege_set.source_action),
                     md(&privilege_set.name),
-                    component_page_relative_path(privilege_set, components),
+                    indexes.page_path(privilege_set),
                     md(if accounts.is_empty() {
                         "—"
                     } else {
@@ -1185,21 +2138,6 @@ fn format_access_section(section: &XmlNode) -> String {
     }
 }
 
-fn component_page_relative_path(component: &Component, components: &[Component]) -> String {
-    let index = components
-        .iter()
-        .position(|candidate| candidate.record_id == component.record_id)
-        .unwrap_or_default()
-        + 1;
-    format!(
-        "{}/{:05}-{}-{}.md",
-        component.kind,
-        index,
-        component.kind,
-        slug(&component.name)
-    )
-}
-
 fn access_setting<'a>(table: &'a XmlNode, name: &str) -> &'a str {
     first_named_node(table, name)
         .and_then(|node| node.attributes.get("access"))
@@ -1335,10 +2273,8 @@ fn is_generated_page_path(name: &str) -> bool {
 
 fn render_component_page(
     component: &Component,
-    filenames: &BTreeMap<&str, String>,
     tables: &BTreeMap<&str, &Component>,
-    all: &[Component],
-    edges: &[AnalysisEdge],
+    indexes: &ComponentIndexes<'_>,
 ) -> String {
     let title = component.kind.replace('_', " ");
     let mut markdown = format!(
@@ -1356,7 +2292,7 @@ fn render_component_page(
     {
         match tables.get(table_id) {
             Some(table) => {
-                if let Some(filename) = filenames.get(table.record_id.as_str()) {
+                if let Some(filename) = indexes.filenames.get(table.record_id.as_str()) {
                     markdown.push_str(&format!(
                         "- Table: [{}](../{})\n",
                         md(&table.name),
@@ -1372,8 +2308,8 @@ fn render_component_page(
     }
     if component.kind == "layout_object"
         && let Some(parent_id) = component.parent_object_id.as_deref()
-        && let Some(parent) = all.iter().find(|item| item.object_id == parent_id)
-        && let Some(filename) = filenames.get(parent.record_id.as_str())
+        && let Some(parent) = indexes.by_id.get(parent_id)
+        && let Some(filename) = indexes.filenames.get(parent.record_id.as_str())
     {
         markdown.push_str(&format!(
             "- Parent: [{}](../{})\n",
@@ -1383,34 +2319,34 @@ fn render_component_page(
     }
     if component.kind == "table" {
         markdown.push_str("\n## Fields\n\n");
-        for field in all.iter().filter(|item| {
-            item.kind == "field"
-                && component
-                    .xml_id
-                    .as_deref()
-                    .is_some_and(|table_id| item.table_id.as_deref() == Some(table_id))
-        }) {
-            if let Some(filename) = filenames.get(field.record_id.as_str()) {
-                markdown.push_str(&format!("- [{}](../{})\n", md(&field.name), filename));
+        if let Some(table_id) = component.xml_id.as_deref() {
+            for field in indexes
+                .fields_by_table_id
+                .get(table_id)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(filename) = indexes.filenames.get(field.record_id.as_str()) {
+                    markdown.push_str(&format!("- [{}](../{})\n", md(&field.name), filename));
+                }
             }
         }
         markdown.push('\n');
     }
     if matches!(component.kind.as_str(), "layout" | "layout_object")
-        && all.iter().any(|item| {
-            item.kind == "layout_object"
-                && item.parent_object_id.as_deref() == Some(component.object_id.as_str())
-                && item.parent_record_id.as_deref() == Some(component.record_id.as_str())
-        })
+        && indexes
+            .children_by_parent
+            .contains_key(&(component.object_id.as_str(), component.record_id.as_str()))
     {
         markdown.push_str("\n## Child objects\n\n");
-        for object in all.iter().filter(|item| {
-            item.kind == "layout_object"
-                && item.parent_object_id.as_deref() == Some(component.object_id.as_str())
-                && item.parent_record_id.as_deref() == Some(component.record_id.as_str())
-        }) {
-            if let Some(filename) = filenames.get(object.record_id.as_str()) {
-                markdown.push_str(&format!("- [{}](../{})\n", md(&object.name), filename));
+        if let Some(children) = indexes
+            .children_by_parent
+            .get(&(component.object_id.as_str(), component.record_id.as_str()))
+        {
+            for object in children {
+                if let Some(filename) = indexes.filenames.get(object.record_id.as_str()) {
+                    markdown.push_str(&format!("- [{}](../{})\n", md(&object.name), filename));
+                }
             }
         }
         markdown.push('\n');
@@ -1439,16 +2375,10 @@ fn render_component_page(
             ));
         }
     }
-    let related_edges: Vec<_> = edges
-        .iter()
-        .filter(|edge| {
-            edge.from_object_id.as_deref() == Some(component.object_id.as_str())
-                || edge.to_object_id.as_deref() == Some(component.object_id.as_str())
-        })
-        .collect();
-    if !related_edges.is_empty() {
+    let related_edges = indexes.edges_by_object_id.get(component.object_id.as_str());
+    if related_edges.is_some_and(|edges| !edges.is_empty()) {
         markdown.push_str("\n## Relationships\n\n");
-        for edge in related_edges {
+        for edge in related_edges.into_iter().flatten() {
             let source = edge
                 .from_record_id
                 .as_deref()
@@ -1659,6 +2589,55 @@ mod tests {
             serde_json::to_vec(&second).unwrap()
         );
         assert_eq!(render_markdown(&first), render_markdown(&second));
+    }
+
+    #[test]
+    fn generates_deterministic_pre_html_bundle_and_machine_artifacts() {
+        let directory = std::env::temp_dir().join(format!(
+            "fmblueprint-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = directory.join("input.xml");
+        let output = directory.join("bundle");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&input, FIXTURE).unwrap();
+
+        run_analysis(vec![input.clone()], Some(output.clone())).unwrap();
+        validate_bundle(&output).unwrap();
+        let artifacts = [
+            "manifest.json",
+            "coverage.json",
+            "diagnostics.json",
+            "graphs/relationships.json",
+            "migration/README.md",
+            "agent/context-map.json",
+            "agent/requirements.jsonl",
+        ];
+        let first: Vec<_> = artifacts
+            .iter()
+            .map(|name| fs::read(output.join(name)).unwrap())
+            .collect();
+        assert!(output.join("schemas/workflow.schema.json").is_file());
+        assert!(output.join("schemas/diagnostic.schema.json").is_file());
+        assert!(output.join("reports/unresolved-references.md").is_file());
+        for line in fs::read_to_string(output.join("objects.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+
+        run_analysis(vec![input], Some(output.clone())).unwrap();
+        let second: Vec<_> = artifacts
+            .iter()
+            .map(|name| fs::read(output.join(name)).unwrap())
+            .collect();
+        assert_eq!(first, second);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
