@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs` contains the `fmblueprint` CLI and bundle/report generation; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative findings, typed edges, and workflow candidates. Unit tests live beside these modules.
+- `src/main.rs` contains the `fmblueprint` CLI and bundle/report generation; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative findings, typed edges, and workflow candidates; `src/html.rs` renders validated bundles into a local interactive site. Unit tests live beside these modules.
 - `schemas/` defines the versioned JSON/JSONL contracts. `docs/filemaker_rust_migration_tool_prompt.md` is the product requirements source; keep `docs/implementation-plan.md`, `docs/sample-analysis-gaps.md`, `docs/format-support.md`, `docs/architecture.md`, `docs/decisions.md`, and `CHANGELOG.md` current.
 - `samples/` contains real FileMaker XML exports for local analysis. Treat these as potentially sensitive and do not add new exports or generated output to Git without explicit approval.
 - The CLI accepts XML files or directories and emits a versioned bundle with coverage, diagnostics, graphs, migration notes, and agent artifacts. A single file defaults to `output/<input-stem>`; `--out` overrides the destination. Component pages are grouped under `objects/<kind>/`; generated output stays outside Git.
@@ -13,9 +13,10 @@
 - `cargo test` runs unit tests, including encoding, malformed XML, redaction, and deterministic output checks.
 - `cargo fmt --check` verifies formatting. Run `cargo fmt` to apply formatting.
 - `cargo clippy --all-targets -- -D warnings` checks all targets and treats warnings as errors.
-- `cargo run -- analyze samples/sample-small.xml` analyzes the smallest supplied sample and writes to `output/sample-small/`. Pass multiple files or a directory to combine exports. Use `--out /tmp/fmblueprint-output` to choose another location.
+- `cargo run -- analyze samples/sample-small.xml` analyzes the smallest supplied sample and writes to `output/sample-small/`. Before analysis starts, it asks whether to generate HTML after the bundle (default no). Pass multiple files or a directory to combine exports. Use `--out /tmp/fmblueprint-output` to choose another location.
 - `cargo run -- validate output/sample-small` checks bundle files, JSON/JSONL syntax, local Markdown links, and edge targets.
 - `cargo run -- context output/sample-small --id '<object-or-workflow-id>' --depth 2` writes a bounded JSON context package to stdout.
+- `cargo run -- render output/sample-small` writes an offline interactive site to `output/sample-small/html/`; open `index.html` directly.
 
 ## Coding Style & Naming Conventions
 

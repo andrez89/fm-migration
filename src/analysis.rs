@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::components::{AnalysisFinding, AttachedRecord, Component, XmlNode};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnalysisEdge {
     pub kind: String,
     pub status: String,
@@ -16,7 +16,7 @@ pub struct AnalysisEdge {
     pub limitations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkflowCandidate {
     pub id: String,
     pub status: String,

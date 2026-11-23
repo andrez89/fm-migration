@@ -7,6 +7,7 @@
 - One or multiple XML files, or a directory of XML files.
 - Observed catalog/action entries and unknown ID-bearing catalog entries are preserved with source provenance.
 - Missing `DDR_INFO`, catalogs, and unresolved references are reported as coverage limits or diagnostics.
+- `render` produces a local interactive HTML viewer from a validated bundle; it adds no remote assets and does not execute FileMaker behavior.
 
 The smallest real fixture is `samples/sample-small.xml` (export format 2.2.2.0, FileMaker 21.0.1, UTF-16 LE). Other supplied XML samples are used for local compatibility checks; their different source identities do not by themselves establish a linked multi-file application.
 

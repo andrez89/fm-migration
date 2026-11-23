@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use quick_xml::{Reader, XmlVersion, encoding::DecodingReader, events::Event};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const KNOWN_CATALOGS: &[&str] = &[
     "AccountsCatalog",
@@ -27,7 +27,7 @@ const KNOWN_CATALOGS: &[&str] = &[
     "ValueListCatalog",
 ];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Component {
     pub record_id: String,
     pub object_id: String,
@@ -48,7 +48,7 @@ pub struct Component {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AttachedRecord {
     pub record_id: String,
     pub kind: String,
@@ -59,7 +59,7 @@ pub struct AttachedRecord {
     pub findings: Vec<AnalysisFinding>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnalysisFinding {
     pub kind: String,
     pub status: String,
@@ -68,7 +68,7 @@ pub struct AnalysisFinding {
     pub limitations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct XmlNode {
     pub name: String,
     pub attributes: BTreeMap<String, String>,

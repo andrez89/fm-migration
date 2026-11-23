@@ -32,9 +32,10 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 ## In progress and future
 
 - Analysis prerequisites implemented: multiple-input inventory, typed references, relationship join edges, script parameter/result candidates and call summaries, heuristic calculation references, workflow links, and source-action security rows. Broader authentic fixture validation remains required.
-- The generated pre-HTML bundle now includes versioned JSON/JSONL artifacts and schemas, coverage/diagnostics, graph datasets, framework-neutral migration documents, agent context/unknown/task/test-seed files, plus `validate` and bounded `context` commands. `validate` checks manifest paths, JSON syntax, local Markdown links, and graph references; complete JSON Schema validation remains a follow-up.
-- Remaining before HTML: validate the full bundle against all supplied real exports; tighten multi-file source identity and calculation/TO semantics from real evidence; test hostile Markdown/path strings and secret redaction across all artifacts; add schema/link contract checks; report unsupported catalogs and feature families exhaustively enough to drive UI filters. Do not present effective authorization or runtime workflows as proven.
-- After those gates: implement the offline HTML reader for the manifest, component JSONL, graph files, workflow candidates, and diagnostics. DDR comparison remains optional and is not a blocker for HTML; keep it as a separate adapter if later justified.
+- The generated bundle includes versioned JSON/JSONL artifacts and schemas, coverage/diagnostics, graph datasets, migration documents, agent context, plus `validate` and bounded `context` commands. `validate` checks manifest paths, JSON syntax, local Markdown links, and graph references. External JSON Schema validation passed for the sample-small and sample-large-b bundles; it is not yet part of the CLI.
+- Offline HTML graphs implemented as `fmblueprint render <bundle> [--out <directory>]`. `relationships.html` draws table occurrences and explicit join predicates, separates source UUIDs and Add/Modify/Remove actions, and filters edges by action. `workflows.html` searches candidates and links to one static, layered SVG per candidate. Nodes link to object details; edge evidence/status and unresolved references remain visible. SVGs pan/zoom; source text is escaped and CSP permits only local assets.
+- Remaining analysis/quality work: validate the latest renderer and bundle writer on the large sample-large-a export (the final rerun was stopped); add hostile-text and multi-input regression coverage; make schema contract validation reproducible; expand unsupported-catalog/version reporting. Multi-file identity, calculation aliases and expression parsing, dynamic script behavior, and effective authorization still require evidence. Do not present runtime workflows or effective access as proven.
+- sample-small verification should record the object, relationship, and workflow page counts and check every local `href`/`src` target. Browser-based visual and keyboard review remains future work. DDR comparison is optional and remains a separate adapter if later justified.
 - DDR support remains an optional decision after paired-export comparison; it must use a separate input adapter.
 - Preserve unsupported or ambiguous source constructs as diagnostics; do not infer a final application state from partial action records.
 - Sample-specific evidence and ranked gaps are tracked in [sample-analysis-gaps.md](sample-analysis-gaps.md). The current sample has no `DDR_INFO`; compare paired exports before deciding whether a separate DDR adapter adds required coverage.
@@ -45,6 +46,7 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 - `cargo test`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo run -- validate <bundle>` validates generated manifest paths, JSON/JSONL syntax, Markdown links, and edge endpoints.
+- `cargo run -- render <bundle>` writes an offline searchable site to `<bundle>/html/`.
 - Local sample check: schema version, action provenance, attached-detail counts, credential redaction, deterministic output, and Markdown links.
 
 ## Constraints

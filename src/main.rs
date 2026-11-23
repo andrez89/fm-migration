@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 mod analysis;
 mod components;
+mod html;
 use analysis::{
     AnalysisEdge, WorkflowCandidate, analyze_calculation_features, analyze_component_references,
     analyze_scripts, discover_workflows,
@@ -68,6 +69,12 @@ enum Commands {
         depth: usize,
         #[arg(long, default_value_t = 250)]
         max_objects: usize,
+    },
+    Render {
+        #[arg(value_name = "BUNDLE")]
+        bundle: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -245,6 +252,7 @@ fn main() -> Result<()> {
             depth,
             max_objects,
         }) => write_context_package(&bundle, &id, depth, max_objects),
+        Some(Commands::Render { bundle, out }) => render_bundle(&bundle, out),
         None if io::stdin().is_terminal() => run_analysis(Vec::new(), None),
         None => {
             let mut command = Cli::command();
@@ -352,6 +360,12 @@ fn validate_bundle(bundle: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn render_bundle(bundle: &Path, output: Option<PathBuf>) -> Result<()> {
+    validate_bundle(bundle)?;
+    let output = output.unwrap_or_else(|| bundle.join("html"));
+    html::render_bundle(bundle, &output)
 }
 
 fn validate_markdown_links(root: &Path, paths: &BTreeSet<String>) -> Result<()> {
@@ -537,6 +551,11 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
         }
         None => default_output,
     };
+    let generate_html = if io::stdin().is_terminal() {
+        prompt_yes_no("Generate interactive HTML after analysis?", false)?
+    } else {
+        false
+    };
     let mut applications = Vec::new();
     let mut catalogs: BTreeMap<(String, String, String), Catalog> = BTreeMap::new();
     let mut known_catalogs_not_observed = Vec::new();
@@ -633,6 +652,11 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
         &indexes,
     )?;
     println!("Inventory written to {}", output.display());
+    if generate_html {
+        render_bundle(&output, None)?;
+    } else {
+        println!("HTML generation skipped.");
+    }
     Ok(())
 }
 
@@ -1044,7 +1068,7 @@ fn write_pre_html_bundle(
     fs::write(reports.join("unresolved-references.md"), unresolved)?;
 
     let mut readme = String::from(
-        "# FileMaker migration blueprint\n\nThis bundle is generated offline from design XML. It does not contain application records and does not prove runtime behavior. Start with the coverage report, then follow evidence links into component pages.\n\n## Main reports\n\n- [Architecture overview](architecture/overview.md)\n- [Data dictionary](data/data-dictionary.md)\n- [Security matrix](security/permission-matrix.md)\n- [Integration inventory](integrations/overview.md)\n- [Workflow candidates](workflows/index.md)\n- [Migration notes](migration/README.md)\n- [Coverage and uncertainty](coverage.json)\n- [Diagnostics](diagnostics.json)\n- [Agent guide](agent/AGENTS.md)\n\nValidate this bundle with `fmblueprint validate <bundle>`. Export bounded context with `fmblueprint context <bundle> --id <object-or-workflow-id> --depth 2 --max-objects 250`.\n",
+        "# FileMaker migration blueprint\n\nThis bundle is generated offline from design XML. It does not contain application records and does not prove runtime behavior. Start with the coverage report, then follow evidence links into component pages.\n\n## Main reports\n\n- [Architecture overview](architecture/overview.md)\n- [Data dictionary](data/data-dictionary.md)\n- [Security matrix](security/permission-matrix.md)\n- [Integration inventory](integrations/overview.md)\n- [Workflow candidates](workflows/index.md)\n- [Migration notes](migration/README.md)\n- [Coverage and uncertainty](coverage.json)\n- [Diagnostics](diagnostics.json)\n- [Agent guide](agent/AGENTS.md)\n\nValidate this bundle with `fmblueprint validate <bundle>`. Render the local interactive viewer with `fmblueprint render <bundle>`; it writes `html/index.html`. Export bounded context with `fmblueprint context <bundle> --id <object-or-workflow-id> --depth 2 --max-objects 250`.\n",
     );
     readme.push_str("\nSchemas are versioned per artifact family in `schemas/`; see the repository compatibility policy before consuming them.\n");
     fs::write(output.join("README.md"), readme)?;
@@ -1384,7 +1408,7 @@ fn collect_output_files(directory: &Path, root: &Path, files: &mut Vec<String>) 
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        if entry.file_type()?.is_dir() && path != root.join("html") {
             collect_output_files(&path, root, files)?;
         } else if entry.file_type()?.is_file() {
             files.push(
@@ -1438,6 +1462,28 @@ fn prompt_path(prompt: &str, default: Option<&Path>) -> Result<PathBuf> {
         return default.map(Path::to_path_buf).context("a path is required");
     }
     Ok(PathBuf::from(value))
+}
+
+fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
+    loop {
+        print!("{prompt} {}: ", if default { "[Y/n]" } else { "[y/N]" });
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        match parse_yes_no(&answer, default) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("Please answer yes or no."),
+        }
+    }
+}
+
+fn parse_yes_no(answer: &str, default: bool) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn expand_xml_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -2551,6 +2597,15 @@ mod tests {
         assert!(serialized.contains("FutureCatalog"));
         assert!(!serialized.contains("PRIVATE PERSON"));
         assert!(!serialized.contains("../Example.fmp12"));
+    }
+
+    #[test]
+    fn html_prompt_defaults_to_no_and_accepts_yes_no_answers() {
+        assert_eq!(parse_yes_no("", false), Some(false));
+        assert_eq!(parse_yes_no("", true), Some(true));
+        assert_eq!(parse_yes_no("y", false), Some(true));
+        assert_eq!(parse_yes_no("NO", false), Some(false));
+        assert_eq!(parse_yes_no("later", false), None);
     }
 
     #[test]

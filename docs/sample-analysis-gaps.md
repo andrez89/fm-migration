@@ -22,7 +22,7 @@ This review uses the smallest supplied export, `samples/sample-small.xml`, and i
 | 2 | Integration analysis | Partial: `integrations/overview.md` summarizes external-source records and explicit reference counts, plus script steps classified as URL, email, import, and export effects. Endpoint resolution, plug-in behavior, and runtime success remain unverified. |
 | 2 | Workflows and migration deliverables | Partial: the bundle includes candidate workflows, screen/data/security/integration migration notes, and validation scenario seeds. These are static planning artifacts; runtime expectations and business requirements require human confirmation. |
 | 2 | Coverage/diagnostic report | Partial: `coverage.json`, `diagnostics.json`, and reports summarize observed catalogs, component/edge/finding counts, preserved XML element counts, unresolved edges, and known limitations. A version-by-version unsupported-feature inventory remains open. |
-| 3 | Offline HTML and graphs | Not started: graph JSON is generated for relationships, calls, navigation, dependencies, and workflows, but the searchable offline site, accessible graph interactions, and safe HTML rendering are not implemented. |
+| 3 | Offline HTML and graphs | Implemented: table-occurrence graph with action/source filtering and grouped join evidence; searchable workflow candidates with a layered, evidence-backed graph per candidate; node links to detail pages, pan/zoom, and unresolved-reference warnings. Local CSS/JS only and restrictive CSP. Browser visual/keyboard review and latest large-export run remain. |
 
 ## DDR export comparison
 
@@ -38,4 +38,4 @@ References: [Claris: Documenting database schemas](https://help.claris.com/en/pr
 2. Add tests for hostile names/paths and scan every artifact for credential redaction; validate manifest and JSONL/schema contracts.
 3. Extend only the remaining evidenced calculation, script, relationship, UI, and privilege semantics; keep unsupported cases explicit.
 4. Finish the measurable coverage inventory and confirm migration/agent packages preserve evidence and uncertainty.
-5. Begin the offline HTML renderer only after those bundle gates pass; the optional paired DDR-versus-`DDR_INFO` comparison may happen separately.
+5. Review the HTML viewer in a browser, including keyboard filters, narrow screens, and sensitive object details; run the latest bundle generator on sample-large-a when requested. The optional paired DDR-versus-`DDR_INFO` comparison may happen separately.
