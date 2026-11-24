@@ -6,10 +6,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 mod analysis;
 mod components;
 mod html;
+mod ui;
 use analysis::{
     AnalysisEdge, WorkflowCandidate, analyze_calculation_features, analyze_component_references,
     analyze_scripts, discover_workflows,
@@ -253,14 +254,9 @@ fn main() -> Result<()> {
             max_objects,
         }) => write_context_package(&bundle, &id, depth, max_objects),
         Some(Commands::Render { bundle, out }) => render_bundle(&bundle, out),
-        None if io::stdin().is_terminal() => run_analysis(Vec::new(), None),
         None => {
-            let mut command = Cli::command();
-            command.print_help()?;
-            println!();
-            bail!(
-                "use `fmblueprint analyze <xml-or-directory>... [--out <directory>]` outside an interactive terminal"
-            )
+            ui::run();
+            Ok(())
         }
     }
 }
@@ -556,6 +552,29 @@ fn run_analysis(inputs: Vec<PathBuf>, output: Option<PathBuf>) -> Result<()> {
     } else {
         false
     };
+    analyze_inputs(inputs, output, generate_html)
+}
+
+fn run_analysis_with_options(input: PathBuf, output: PathBuf, generate_html: bool) -> Result<()> {
+    let inputs = expand_xml_inputs(&[input])?;
+    analyze_inputs(inputs, output, generate_html)
+}
+
+fn output_dir_is_nonempty(output: &Path) -> Result<bool> {
+    if !output.exists() {
+        return Ok(false);
+    }
+    if !output.is_dir() {
+        bail!("output path is not a directory: {}", output.display());
+    }
+    if let Some(entry) = fs::read_dir(output)?.next() {
+        entry?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn analyze_inputs(inputs: Vec<PathBuf>, output: PathBuf, generate_html: bool) -> Result<()> {
     let mut applications = Vec::new();
     let mut catalogs: BTreeMap<(String, String, String), Catalog> = BTreeMap::new();
     let mut known_catalogs_not_observed = Vec::new();
@@ -2692,6 +2711,50 @@ mod tests {
             .map(|name| fs::read(output.join(name)).unwrap())
             .collect();
         assert_eq!(first, second);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_analysis_options_control_html_without_cli_prompts() {
+        let directory = std::env::temp_dir().join(format!(
+            "fmblueprint-gui-analysis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = directory.join("sample.xml");
+        let without_html = directory.join("without-html");
+        let with_html = directory.join("with-html");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&input, FIXTURE).unwrap();
+
+        run_analysis_with_options(input.clone(), without_html.clone(), false).unwrap();
+        assert!(without_html.join("manifest.json").is_file());
+        assert!(!without_html.join("html").exists());
+
+        run_analysis_with_options(input, with_html.clone(), true).unwrap();
+        assert!(with_html.join("html/index.html").is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn detects_existing_output_content_before_gui_overwrite_prompt() {
+        let directory = std::env::temp_dir().join(format!(
+            "fmblueprint-output-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let absent = directory.join("not-created");
+        fs::create_dir_all(&directory).unwrap();
+        assert!(!output_dir_is_nonempty(&absent).unwrap());
+        assert!(!output_dir_is_nonempty(&directory).unwrap());
+        fs::write(directory.join("notes.txt"), "keep").unwrap();
+        assert!(output_dir_is_nonempty(&directory).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
 

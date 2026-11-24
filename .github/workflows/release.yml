@@ -26,22 +26,37 @@ jobs:
             platform: macos
             arch: x86_64
           - os: windows-2025
-            target: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-gnu
             platform: windows
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - if: matrix.platform == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-gcc zip
+      - if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev pkg-config
+      - if: matrix.platform == 'macos'
+        run: brew install gtk4 pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: ${{ matrix.target }}
+      - if: matrix.platform == 'windows'
+        run: echo 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc' >> "$GITHUB_ENV"
+        shell: msys2 {0}
       - name: Verify release tag matches Cargo version
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "${GITHUB_REF_NAME#v}" = "$version"
-        shell: bash
+        shell: ${{ matrix.platform == 'windows' && 'msys2 {0}' || 'bash' }}
       - run: cargo test --locked --target ${{ matrix.target }}
+        shell: ${{ matrix.platform == 'windows' && 'msys2 {0}' || 'bash' }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
+        shell: ${{ matrix.platform == 'windows' && 'msys2 {0}' || 'bash' }}
       - name: Package Unix archive
         if: matrix.platform != 'windows'
         run: |

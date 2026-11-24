@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add a GTK desktop interface for selecting one XML export, choosing an output directory, and optionally generating the HTML recap.
+- Keep the CLI commands available and run GUI analysis asynchronously; add GTK dependencies to cross-platform CI and release builds.
+
 ## 0.1.0 — 2026-11-24
 
 - Preserve source-action records and add evidence-backed relationship, script, and workflow analysis.

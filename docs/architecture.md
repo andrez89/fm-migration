@@ -1,11 +1,12 @@
 # Architecture
 
-`fmblueprint` currently uses one Cargo binary with four implementation modules:
+`fmblueprint` uses one Cargo binary with a GTK desktop interface and CLI, sharing the analysis pipeline:
 
 - `components.rs` streams `FMSaveAsXML`, preserves source/action records and attached records, and redacts credential-like values.
 - `analysis.rs` builds symbols, typed evidence edges, script findings, calculation candidates, workflow candidates, and relationship join edges.
 - `html.rs` renders a validated bundle into an offline searchable site with object, relationship, workflow, diagnostic, and coverage views.
-- `main.rs` owns the CLI, per-file inventory, Markdown/JSON/JSONL reports, schemas, migration artifacts, agent context, and bundle validation.
+- `ui.rs` provides XML and output-folder pickers, HTML selection, background analysis status, and an explicit action to open the result folder.
+- `main.rs` owns the CLI, shared analysis entry points, per-file inventory, Markdown/JSON/JSONL reports, schemas, migration artifacts, agent context, and bundle validation.
 
 The pipeline is `XML inputs → normalized component records → deterministic analysis edges/findings → stable bundle`. All generated views consume the normalized records and typed edges; report code does not parse source XML a second time. Add/Modify/Remove records remain separate. A unique cross-file UUID match is heuristic because supplied files are not proof of FileMaker external-source identity.
 

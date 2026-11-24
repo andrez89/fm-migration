@@ -1,6 +1,6 @@
 # `fmblueprint` implementation plan
 
-Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and real exports outside Git.
+Live status for the Rust FileMaker XML analysis application and CLI. Keep generated reports and real exports outside Git.
 
 ## Phase 1 — inventory (complete)
 
@@ -34,6 +34,7 @@ Live status for the Rust FileMaker XML analysis CLI. Keep generated reports and 
 - Analysis prerequisites implemented: multiple-input inventory, typed references, relationship join edges, script parameter/result candidates and call summaries, heuristic calculation references, workflow links, and source-action security rows. Broader authentic fixture validation remains required.
 - The generated bundle includes versioned JSON/JSONL artifacts and schemas, coverage/diagnostics, graph datasets, migration documents, agent context, plus `validate` and bounded `context` commands. `validate` checks manifest paths, JSON syntax, local Markdown links, and graph references. External JSON Schema validation passed for two supplied sample bundles; it is not yet part of the CLI.
 - Offline HTML graphs implemented as `fmblueprint render <bundle> [--out <directory>]`. `relationships.html` draws table occurrences and explicit join predicates, separates source UUIDs and Add/Modify/Remove actions, and filters edges by action. `workflows.html` searches candidates and links to one static, layered SVG per candidate. Nodes link to object details; edge evidence/status and unresolved references remain visible. SVGs pan/zoom; source text is escaped and CSP permits only local assets.
+- GTK desktop interface implemented: select one XML file, edit the suggested `output/<filename-stem>` path, optionally create the HTML recap, follow background status/errors, and open the output folder after success. CLI commands remain available. CI and release builds install GTK development libraries; desktop interaction still needs manual checks on Linux, macOS, and Windows.
 - Remaining analysis/quality work: validate the latest renderer and bundle writer on the largest supplied export (the final rerun was stopped); add hostile-text and multi-input regression coverage; make schema contract validation reproducible; expand unsupported-catalog/version reporting. Multi-file identity, calculation aliases and expression parsing, dynamic script behavior, and effective authorization still require evidence. Do not present runtime workflows or effective access as proven.
 - Sample verification should record object, relationship, and workflow page counts and check every local `href`/`src` target. Browser-based visual and keyboard review remains future work. DDR comparison is optional and remains a separate adapter if later justified.
 - DDR support remains an optional decision after paired-export comparison; it must use a separate input adapter.

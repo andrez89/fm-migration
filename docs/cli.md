@@ -1,6 +1,14 @@
 # CLI reference
 
-Build and run the tool with stable Rust:
+Build and run the GTK desktop interface with stable Rust and GTK4 development libraries:
+
+```sh
+cargo run
+```
+
+The GUI selects one XML file and suggests `output/<filename-stem>`. Its **Create HTML recap** checkbox is off by default. After analysis, use **Open folder** to reveal the output in the system file manager.
+
+The command-line interface remains available:
 
 ```sh
 cargo run -- analyze path/to/sample.xml

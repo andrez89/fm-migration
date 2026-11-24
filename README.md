@@ -1,6 +1,6 @@
 # FileMaker Migration Blueprint
 
-`fmblueprint` is an offline Rust command-line tool that analyzes Claris FileMaker **Save a Copy as XML** exports and builds a navigable migration blueprint. It preserves source-action history and records evidence and uncertainty instead of claiming runtime behavior the XML cannot prove.
+`fmblueprint` is an offline Rust application with a GTK desktop interface and CLI. It analyzes Claris FileMaker **Save a Copy as XML** exports and builds a navigable migration blueprint. It preserves source-action history and records evidence and uncertainty instead of claiming runtime behavior the XML cannot prove.
 
 ## What it produces
 
@@ -13,10 +13,18 @@ The tool does not execute FileMaker scripts, connect to services, or require net
 
 ## Quick start
 
-Install stable Rust with Edition 2024 support, then build and analyze an export:
+Install stable Rust with Edition 2024 support and the GTK4 development libraries for your platform, then build and launch the desktop interface:
 
 ```sh
 cargo build --release
+cargo run --release
+```
+
+The GUI lets you select one XML file, proposes `output/<filename-stem>` as the destination, and can optionally create the HTML recap. GTK is a system dependency and is not bundled in release archives. Install GTK4 development files and `pkg-config` with your platform package manager (for example, `libgtk-4-dev pkg-config` on Debian/Ubuntu or `gtk4 pkg-config` with Homebrew). On Windows, install GTK4 development/runtime files and make `pkg-config` and the GTK DLL directory available on `PATH`.
+
+The CLI remains available for scripted use:
+
+```sh
 cargo run --release -- analyze /path/to/export.xml --out /tmp/fmblueprint
 cargo run --release -- validate /tmp/fmblueprint
 cargo run --release -- render /tmp/fmblueprint
@@ -45,6 +53,7 @@ For format coverage, architecture, and remaining analysis gaps, see [format supp
 
 - `src/components.rs` parses XML and preserves component records.
 - `src/analysis.rs` resolves references and derives static findings and typed edges.
+- `src/ui.rs` provides the GTK desktop interface.
 - `src/html.rs` renders the local documentation viewer.
 - `src/main.rs` wires the CLI, bundle generation, and validation.
 - `schemas/` contains the versioned artifact contracts; `docs/` contains the [project objectives](docs/filemaker_rust_migration_tool_prompt.md) and implementation notes.

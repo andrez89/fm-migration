@@ -2,14 +2,15 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs` contains the `fmblueprint` CLI and bundle/report generation; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative findings, typed edges, and workflow candidates; `src/html.rs` renders validated bundles into a local interactive site. Unit tests live beside these modules.
+- `src/main.rs` contains the `fmblueprint` CLI and shared bundle/report generation; `src/ui.rs` is the GTK desktop interface; `src/components.rs` streams source/action records and attached XML details; `src/analysis.rs` builds conservative findings, typed edges, and workflow candidates; `src/html.rs` renders validated bundles into a local interactive site. Unit tests live beside these modules.
 - `schemas/` defines the versioned JSON/JSONL contracts. `docs/filemaker_rust_migration_tool_prompt.md` is the product requirements source; keep `docs/implementation-plan.md`, `docs/sample-analysis-gaps.md`, `docs/format-support.md`, `docs/architecture.md`, `docs/decisions.md`, and `CHANGELOG.md` current.
 - Use synthetic XML in unit tests. Keep real FileMaker exports and generated analysis output outside the repository; they may contain confidential design and identity data.
 - The CLI accepts XML files or directories and emits a versioned bundle with coverage, diagnostics, graphs, migration notes, and agent artifacts. A single file defaults to `output/<input-stem>`; `--out` overrides the destination. Component pages are grouped under `objects/<kind>/`; generated output stays outside Git.
 
 ## Build, Test, and Development Commands
 
-- `cargo build` compiles the CLI; `cargo build --release` creates an optimized binary.
+- Install GTK4 development libraries and `pkg-config`, then `cargo build` compiles the app; `cargo build --release` creates an optimized binary. GTK runtime libraries are not bundled in release archives.
+- `cargo run` opens the GUI; `cargo run -- analyze path/to/sample.xml` runs the CLI.
 - `cargo test` runs unit tests, including encoding, malformed XML, redaction, and deterministic output checks.
 - `cargo fmt --check` verifies formatting. Run `cargo fmt` to apply formatting.
 - `cargo clippy --all-targets -- -D warnings` checks all targets and treats warnings as errors.
