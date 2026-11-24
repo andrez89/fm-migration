@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - name: Verify release tag matches Cargo version
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "${GITHUB_REF_NAME#v}" = "$version"
+        shell: bash
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package Unix archive
+        if: matrix.platform != 'windows'
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/fmblueprint" README.md LICENSE dist/
+          tar -czf "fmblueprint-${GITHUB_REF_NAME#v}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" -C dist .
+        shell: bash
+      - name: Package Windows archive
+        if: matrix.platform == 'windows'
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/fmblueprint.exe", README.md, LICENSE dist/
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          Compress-Archive -Path dist/* -DestinationPath "fmblueprint-$version-windows-${{ matrix.arch }}.zip"
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: fmblueprint-*-${{ matrix.platform }}-${{ matrix.arch }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --verify-tag --generate-notes

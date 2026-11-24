@@ -57,6 +57,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Releases
+
+Pushing a version tag such as `v0.1.1` runs the release workflow. The tag must match `package.version` in `Cargo.toml`; the workflow tests and builds Linux, macOS (Apple Silicon and Intel), and Windows binaries, then creates a GitHub Release with downloadable archives. Bump `Cargo.toml` and update `CHANGELOG.md` before tagging.
+
 ## License and author
 
 Released under the [MIT License](LICENSE). Copyright © 2026 Andrez. Contact: [andre@amovez.it](mailto:andre@amovez.it).
