@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-11-24
 
 - Preserve source-action records and add evidence-backed relationship, script, and workflow analysis.
 - Generate versioned bundle artifacts, coverage and diagnostic reports, migration documents, and bounded agent context.
