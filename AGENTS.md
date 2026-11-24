@@ -28,7 +28,7 @@ Add focused unit tests alongside the code in `src/main.rs` (`#[cfg(test)] mod te
 
 ## Commit & Pull Request Guidelines
 
-This repository has no commit history yet, so no established commit convention can be inferred. Use concise Conventional Commit subjects (for example, `feat: inventory XML catalogs`). Pull requests should summarize behavior changes, list verification commands and results, note format limitations, and confirm generated artifacts or sensitive XML were not added unintentionally. Screenshots are unnecessary for this CLI.
+Use concise Conventional Commit subjects, matching the existing lowercase style (for example, `feat: inventory XML catalogs` or `chore: anonymize sample references`). Pull requests should summarize behavior changes, list verification commands and results, note format limitations, and confirm generated artifacts or sensitive XML were not added unintentionally. Screenshots are unnecessary for this CLI. The project is released under the MIT License in `LICENSE`.
 
 ## Architecture & Compatibility
 

@@ -2,6 +2,10 @@
 name = "fm-migration"
 version = "0.1.0"
 edition = "2024"
+authors = ["Andrez <andre@amovez.it>"]
+description = "Offline analysis and documentation for FileMaker XML exports"
+license = "MIT"
+readme = "README.md"
 
 [[bin]]
 name = "fmblueprint"
