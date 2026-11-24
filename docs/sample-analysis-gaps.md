@@ -1,6 +1,6 @@
 # Sample Analysis: Coverage and Gaps
 
-This review uses the smallest supplied export, `samples/sample-small.xml`, and its existing local output at `output/sample-small/`. Counts describe the records in this export, not necessarily the final FileMaker application state: it contains both `AddAction` and partial `ModifyAction` records.
+This review uses the smallest supplied export. Counts describe records in that export, not necessarily the final FileMaker application state: it contains both `AddAction` and partial `ModifyAction` records.
 
 ## What the current analysis establishes
 
@@ -38,4 +38,4 @@ References: [Claris: Documenting database schemas](https://help.claris.com/en/pr
 2. Add tests for hostile names/paths and scan every artifact for credential redaction; validate manifest and JSONL/schema contracts.
 3. Extend only the remaining evidenced calculation, script, relationship, UI, and privilege semantics; keep unsupported cases explicit.
 4. Finish the measurable coverage inventory and confirm migration/agent packages preserve evidence and uncertainty.
-5. Review the HTML viewer in a browser, including keyboard filters, narrow screens, and sensitive object details; run the latest bundle generator on sample-large-a when requested. The optional paired DDR-versus-`DDR_INFO` comparison may happen separately.
+5. Review the HTML viewer in a browser, including keyboard filters, narrow screens, and sensitive object details; run the latest bundle generator on the largest supplied export when requested. The optional paired DDR-versus-`DDR_INFO` comparison may happen separately.

@@ -3,7 +3,7 @@
 Build and run the tool with stable Rust:
 
 ```sh
-cargo run -- analyze samples/sample-small.xml
+cargo run -- analyze path/to/sample.xml
 cargo run -- analyze exports/ --out /tmp/blueprint
 cargo run -- validate /tmp/blueprint
 cargo run -- context /tmp/blueprint --id 'workflow:<workflow-id>' --depth 2 --max-objects 250

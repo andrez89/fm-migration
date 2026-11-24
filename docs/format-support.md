@@ -9,7 +9,7 @@
 - Missing `DDR_INFO`, catalogs, and unresolved references are reported as coverage limits or diagnostics.
 - `render` produces a local interactive HTML viewer from a validated bundle; it adds no remote assets and does not execute FileMaker behavior.
 
-The smallest real fixture is `samples/sample-small.xml` (export format 2.2.2.0, FileMaker 21.0.1, UTF-16 LE). Other supplied XML samples are used for local compatibility checks; their different source identities do not by themselves establish a linked multi-file application.
+The smallest supplied real export uses format 2.2.2.0, FileMaker 21.0.1, and UTF-16 LE. Other local XML exports are used for compatibility checks; their different source identities do not by themselves establish a linked multi-file application.
 
 ## Unsupported or not established
 
